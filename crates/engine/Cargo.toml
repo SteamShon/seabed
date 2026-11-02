@@ -1,0 +1,12 @@
+[package]
+name = "seabed-engine"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+[dependencies]
+seabed-domain = { path = "../domain" }
+seabed-ports = { path = "../ports" }
+
+[dev-dependencies]
+seabed-adapter-objectstore-mem = { path = "../adapter-objectstore-mem" }

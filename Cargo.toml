@@ -1,0 +1,9 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/domain",
+    "crates/ports",
+    "crates/adapter-objectstore-mem",
+    "crates/engine",
+    "crates/conformance",
+]
