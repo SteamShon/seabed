@@ -67,10 +67,16 @@ fn range_reads<S: ObjectStore>(s: &S) {
     assert_eq!(s.get_range(&key, 0..0).unwrap(), b"");
     assert_eq!(s.get_range(&key, 10..10).unwrap(), b"");
     assert_eq!(s.get_range(&key, 0..10).unwrap(), b"0123456789");
-    assert_eq!(s.get_range(&key, 5..11).unwrap_err(), StoreError::InvalidRange);
+    assert_eq!(
+        s.get_range(&key, 5..11).unwrap_err(),
+        StoreError::InvalidRange
+    );
 
     let reversed = Range { start: 6, end: 5 };
-    assert_eq!(s.get_range(&key, reversed).unwrap_err(), StoreError::InvalidRange);
+    assert_eq!(
+        s.get_range(&key, reversed).unwrap_err(),
+        StoreError::InvalidRange
+    );
 
     assert_eq!(
         s.get_range(&k("t/a/n/b/missing"), 0..1).unwrap_err(),
@@ -79,9 +85,19 @@ fn range_reads<S: ObjectStore>(s: &S) {
 }
 
 fn list_prefix_sorted<S: ObjectStore>(s: &S) {
-    for name in ["t/a/n/b/wal/3", "t/a/n/b/wal/1", "t/a/n/b/wal/2", "t/a/n/b/other/1", "t/a/n/c/wal/1"] {
-        s.put(&k(name), name.as_bytes().to_vec(), PutCondition::Unconditional)
-            .unwrap();
+    for name in [
+        "t/a/n/b/wal/3",
+        "t/a/n/b/wal/1",
+        "t/a/n/b/wal/2",
+        "t/a/n/b/other/1",
+        "t/a/n/c/wal/1",
+    ] {
+        s.put(
+            &k(name),
+            name.as_bytes().to_vec(),
+            PutCondition::Unconditional,
+        )
+        .unwrap();
     }
     let keys: Vec<String> = s
         .list("t/a/n/b/wal/")
@@ -100,7 +116,8 @@ fn list_prefix_sorted<S: ObjectStore>(s: &S) {
 fn delete_is_idempotent<S: ObjectStore>(s: &S) {
     let key = k("t/a/n/b/del");
     s.delete(&key).unwrap(); // deleting a missing key succeeds
-    s.put(&key, b"x".to_vec(), PutCondition::Unconditional).unwrap();
+    s.put(&key, b"x".to_vec(), PutCondition::Unconditional)
+        .unwrap();
     s.delete(&key).unwrap();
     assert_eq!(s.get(&key).unwrap_err(), StoreError::NotFound);
     s.delete(&key).unwrap();
@@ -108,7 +125,8 @@ fn delete_is_idempotent<S: ObjectStore>(s: &S) {
 
 fn if_none_match_creates_once<S: ObjectStore>(s: &S) {
     let key = k("t/a/n/b/once");
-    s.put(&key, b"first".to_vec(), PutCondition::IfNoneMatch).unwrap();
+    s.put(&key, b"first".to_vec(), PutCondition::IfNoneMatch)
+        .unwrap();
     assert_eq!(
         s.put(&key, b"second".to_vec(), PutCondition::IfNoneMatch)
             .unwrap_err(),
@@ -122,12 +140,18 @@ fn if_match_semantics<S: ObjectStore>(s: &S) {
 
     // S3 semantics: If-Match on a missing key fails with NotFound.
     assert_eq!(
-        s.put(&key, b"x".to_vec(), PutCondition::IfMatch(ETag::new("\"nope\"")))
-            .unwrap_err(),
+        s.put(
+            &key,
+            b"x".to_vec(),
+            PutCondition::IfMatch(ETag::new("\"nope\""))
+        )
+        .unwrap_err(),
         StoreError::NotFound
     );
 
-    let e1 = s.put(&key, b"v1".to_vec(), PutCondition::Unconditional).unwrap();
+    let e1 = s
+        .put(&key, b"v1".to_vec(), PutCondition::Unconditional)
+        .unwrap();
     let e2 = s
         .put(&key, b"v2".to_vec(), PutCondition::IfMatch(e1.clone()))
         .unwrap();
@@ -160,7 +184,11 @@ fn concurrent_create_race<S: ObjectStore>(s: &S) {
         .filter(|(_, r)| r.is_ok())
         .map(|(id, _)| *id)
         .collect();
-    assert_eq!(winners.len(), 1, "exactly one creator must win, got {winners:?}");
+    assert_eq!(
+        winners.len(),
+        1,
+        "exactly one creator must win, got {winners:?}"
+    );
 
     for (_, r) in &results {
         if let Err(e) = r {
@@ -179,7 +207,8 @@ fn concurrent_cas_counter<S: ObjectStore>(s: &S) {
     const PER_THREAD: u64 = 50;
 
     let key = k("t/a/n/b/counter");
-    s.put(&key, b"0".to_vec(), PutCondition::Unconditional).unwrap();
+    s.put(&key, b"0".to_vec(), PutCondition::Unconditional)
+        .unwrap();
 
     thread::scope(|sc| {
         for _ in 0..THREADS {

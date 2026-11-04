@@ -1,4 +1,6 @@
-use seabed_adapter_objectstore_mem::{CountingObjectStore, FaultConfig, FaultInjecting, MemObjectStore};
+use seabed_adapter_objectstore_mem::{
+    CountingObjectStore, FaultConfig, FaultInjecting, MemObjectStore,
+};
 use seabed_conformance::run_object_store_suite;
 
 #[test]
