@@ -359,8 +359,8 @@ fn vectors_array(rows: &[VecCell]) -> ArrayRef {
 /// Builds a SoT-shaped Parquet file with plain arrow, the way another tool might.
 struct Foreign {
     ids: Vec<Option<&'static str>>,
-    lsns: Vec<i64>,
-    deleted: Vec<bool>,
+    lsns: Vec<Option<i64>>,
+    deleted: Vec<Option<bool>>,
     vectors: Vec<VecCell>,
     extra: Vec<(Field, ArrayRef)>,
     metadata: Option<Vec<(&'static str, &'static str)>>,
@@ -370,8 +370,8 @@ impl Foreign {
     fn one(vector: [f32; 3]) -> Self {
         Foreign {
             ids: vec![Some("x")],
-            lsns: vec![1],
-            deleted: vec![false],
+            lsns: vec![Some(1)],
+            deleted: vec![Some(false)],
             vectors: vec![Some(vec![Some(vector.iter().map(|f| Some(*f)).collect())])],
             extra: vec![],
             metadata: Some(vec![
@@ -385,8 +385,8 @@ impl Foreign {
         let vectors = vectors_array(&self.vectors);
         let mut fields = vec![
             Field::new("id", DataType::Utf8, true),
-            Field::new("lsn", DataType::Int64, false),
-            Field::new("deleted", DataType::Boolean, false),
+            Field::new("lsn", DataType::Int64, true),
+            Field::new("deleted", DataType::Boolean, true),
             Field::new("vectors", vectors.data_type().clone(), true),
         ];
         let mut cols: Vec<ArrayRef> = vec![
@@ -434,7 +434,7 @@ fn decode_applies_the_same_rules_to_files_written_by_other_tools() {
         Err(SotError::NonFinite { .. })
     ));
     let mut tomb = Foreign::one([1.0, 2.0, 3.0]);
-    tomb.deleted = vec![true];
+    tomb.deleted = vec![Some(true)];
     assert!(matches!(
         decode(&tomb.bytes(), DIMS),
         Err(SotError::TombstoneWithData { .. })
@@ -463,9 +463,19 @@ fn decode_rejects_nulls_inside_vectors_at_every_level() {
 
 #[test]
 fn decode_rejects_nulls_in_fixed_columns() {
-    let mut f = Foreign::one([1.0, 2.0, 3.0]);
-    f.ids = vec![None];
-    assert!(is_format(decode(&f.bytes(), DIMS)));
+    let mut id = Foreign::one([1.0, 2.0, 3.0]);
+    id.ids = vec![None];
+    let mut lsn = Foreign::one([1.0, 2.0, 3.0]);
+    lsn.lsns = vec![None];
+    let mut deleted = Foreign::one([1.0, 2.0, 3.0]);
+    deleted.deleted = vec![None];
+    for (col, f) in [("id", id), ("lsn", lsn), ("deleted", deleted)] {
+        // Otherwise a null lsn would read as 0 and a null deleted as false.
+        assert!(
+            is_format(decode(&f.bytes(), DIMS)),
+            "null {col} must be rejected"
+        );
+    }
 }
 
 #[test]
@@ -473,8 +483,8 @@ fn decode_rejects_unsorted_or_duplicate_ids() {
     for ids in [[Some("b"), Some("a")], [Some("a"), Some("a")]] {
         let mut f = Foreign::one([1.0, 2.0, 3.0]);
         f.ids = ids.to_vec();
-        f.lsns = vec![1, 2];
-        f.deleted = vec![true, true];
+        f.lsns = vec![Some(1), Some(2)];
+        f.deleted = vec![Some(true), Some(true)];
         f.vectors = vec![Some(vec![]), Some(vec![])];
         assert!(is_format(decode(&f.bytes(), DIMS)), "{ids:?}");
     }
@@ -491,6 +501,18 @@ fn decode_rejects_a_bad_attribute_column_name() {
         decode(&f.bytes(), DIMS).unwrap_err(),
         SotError::InvalidAttrName("Color".into())
     );
+
+    // All values null: the row-level validation never sees the name, so only the
+    // column-level check stops the column from silently disappearing.
+    let mut all_null = Foreign::one([1.0, 2.0, 3.0]);
+    all_null.extra = vec![(
+        Field::new("Color", DataType::Utf8, true),
+        Arc::new(StringArray::from(vec![None::<&str>])),
+    )];
+    assert_eq!(
+        decode(&all_null.bytes(), DIMS).unwrap_err(),
+        SotError::InvalidAttrName("Color".into())
+    );
 }
 
 #[test]
@@ -498,6 +520,7 @@ fn decode_requires_matching_format_version_and_dims_metadata() {
     let cases = [
         None,
         Some(vec![("seabed.sot.dims", "3")]),
+        Some(vec![("seabed.sot.format_version", "1")]),
         Some(vec![
             ("seabed.sot.format_version", "2"),
             ("seabed.sot.dims", "3"),
@@ -517,7 +540,7 @@ fn decode_requires_matching_format_version_and_dims_metadata() {
 #[test]
 fn decode_rejects_a_negative_lsn() {
     let mut f = Foreign::one([1.0, 2.0, 3.0]);
-    f.lsns = vec![-1];
+    f.lsns = vec![Some(-1)];
     assert!(is_format(decode(&f.bytes(), DIMS)));
 }
 

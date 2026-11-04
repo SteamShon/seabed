@@ -131,7 +131,7 @@ v0.5 · 2026-11-04 · 대화에서 합의한 내용 기준. v0.5는 계획 리�
 
 자체 조인 엔진을 만들지 않는다. SoT를 표준 컬럼너 포맷과 스냅샷 메타데이터로 노출해 외부 엔진이 읽게 한다.
 
-구현(M1): `seabed_engine::sot`. segment마다 `segments/<id>/docs.parquet`를 둔다. 이 파일은 seabed 컨테이너(`.sbsg`) 안이 아니라 독립된 Parquet 객체라서 DuckDB 같은 외부 엔진이 그대로 읽는다. 컬럼은 `id`, `lsn`, `deleted`(tombstone), `vectors`(list<fixed_size_list<f32, dims>>), 속성마다 nullable 컬럼(utf8/int64/float64/bool) 하나씩이다. 행은 id 순으로 정렬되고 id가 겹치지 않으며, 같은 행이면 항상 같은 바이트로 인코딩된다. 파일 메타데이터에 `seabed.sot.format_version`과 `seabed.sot.dims`를 기록하고 읽을 때 확인한다. `lsn`은 Spark 등 외부 엔진 호환을 위해 int64로 저장한다(`i64::MAX` 초과 거부). manifest의 segment 목록에 SoT 파일을 연결하는 일과 미인덱싱 꼬리 병합은 다음 작업이다.
+구현(M1): `seabed_engine::sot`. segment마다 `segments/<id>/docs.parquet`를 둔다. 이 파일은 seabed 컨테이너(`.sbsg`) 안이 아니라 독립된 Parquet 객체라서 DuckDB 같은 외부 엔진이 그대로 읽는다. 컬럼은 `id`, `lsn`, `deleted`(tombstone), `vectors`(list<fixed_size_list<f32, dims>>), 속성마다 nullable 컬럼(utf8/int64/float64/bool) 하나씩이다. 행은 id 순으로 정렬되고 id가 겹치지 않는다. 같은 Parquet writer 버전이면 같은 행은 같은 바이트로 인코딩된다. writer 버전이 바뀌면 바이트가 달라질 수 있으며, manifest는 실제로 쓴 바이트의 크기와 SHA-256을 기록한다. 파일 메타데이터에 `seabed.sot.format_version`과 `seabed.sot.dims`를 기록하고 읽을 때 확인한다. `lsn`은 Spark 등 외부 엔진 호환을 위해 int64로 저장한다(`i64::MAX` 초과 거부). manifest의 segment 목록에 SoT 파일을 연결하는 일과 미인덱싱 꼬리 병합은 다음 작업이다.
 
 **[결정] 다음 PR(manifest 연결)의 선행 조건: namespace 단위 속성 스키마.** 지금은 파일마다 속성 타입을 추론한다. 그래서 DuckDB가 여러 segment를 glob으로 읽으면 첫 파일 스키마를 따라 값이 바뀌거나 열이 경고 없이 사라질 수 있다(PR #11 리뷰에서 확인). manifest에 속성 이름→타입을 두고(추가만 허용), encode가 그 스키마의 모든 열을 항상 쓰고 decode가 기대 스키마와 비교하게 한다. 외부 엔진은 glob이 아니라 manifest의 파일 목록을 읽어야 스냅샷이 된다. 실제 분석 패턴은 불확실(조인 + group by 배치로 추정)이라 M5에서 확정.
 
