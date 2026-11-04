@@ -47,6 +47,11 @@ pub enum SegmentError {
     /// The segment id would not be accepted by the manifest (or could escape the namespace's
     /// key prefix). Checked before anything is written.
     InvalidSegmentId(String),
+    /// The object at a manifest-listed segment's key is not the one the manifest recorded
+    /// (different TOC hash): it was replaced, not damaged. Distinct from `Corrupt`.
+    RefMismatch {
+        id: String,
+    },
     DuplicateSection(String),
     MissingSection(String),
     UnsupportedVersion(u16),
@@ -246,9 +251,9 @@ impl<S: ObjectStore> SegmentStore<S> {
     ) -> Result<SegmentReader<'_, S>, SegmentError> {
         let reader = self.open(&keys.segment_key(&segment.id, DATA_FILE), segment.size)?;
         if reader.toc_sha256 != segment.toc_sha256.0 {
-            return Err(SegmentError::Corrupt(
-                "segment does not match the manifest record",
-            ));
+            return Err(SegmentError::RefMismatch {
+                id: segment.id.clone(),
+            });
         }
         Ok(reader)
     }

@@ -4,6 +4,10 @@
 //! Encoded as JSON. Manifests are small, JSON is easy to inspect with plain object-store tools,
 //! and serde writes struct fields in declaration order, so the same content always encodes to
 //! the same bytes.
+//!
+//! Unknown fields are rejected (`deny_unknown_fields`). Otherwise an older writer would decode a
+//! newer manifest, drop the fields it does not know, and commit the result. **Adding a field
+//! therefore requires bumping `CONTENT_FORMAT_VERSION`.**
 
 use std::collections::HashSet;
 use std::fmt;
@@ -76,6 +80,7 @@ pub enum Distance {
 /// What the indexes were built with. Querying or writing with anything else must fail at once,
 /// because the result would be silently wrong (wrong embedding space, wrong tokens).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IndexBinding {
     pub embedding_model: String,
     pub dimensions: u32,
@@ -173,6 +178,7 @@ impl<'de> Deserialize<'de> for Sha256Hex {
 
 /// One immutable segment that belongs to this manifest version.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SegmentRef {
     /// Directory name under the namespace's `segments/`. ASCII letters, digits, `-` and `_`.
     pub id: String,
@@ -194,6 +200,7 @@ pub fn valid_segment_id(id: &str) -> bool {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ManifestContent {
     pub format_version: u32,
     pub tenant: String,

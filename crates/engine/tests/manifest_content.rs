@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use proptest::prelude::*;
 
-use seabed_adapter_objectstore_mem::MemObjectStore;
+use seabed_adapter_objectstore_mem::{CountingObjectStore, MemObjectStore};
 use seabed_domain::{Lsn, NamespaceId, NamespaceKeys, TenantId};
 use seabed_engine::manifest::{ManifestError, ManifestStore};
 use seabed_engine::manifest_content::{
@@ -120,6 +120,8 @@ fn decode_rejects_bad_input() {
 fn add_segment_validates_ids() {
     let mut c = ManifestContent::empty(&keys());
     c.add_segment(seg_ref("a_1-B")).unwrap();
+    // 128 characters is the longest accepted id; 129 is rejected below.
+    c.add_segment(seg_ref(&"x".repeat(128))).unwrap();
     assert_eq!(
         c.add_segment(seg_ref("a_1-B")).unwrap_err(),
         ContentError::DuplicateSegment("a_1-B".into())
@@ -216,9 +218,9 @@ fn open_ref_detects_a_different_object_at_the_recorded_key() {
 
     assert_eq!(
         segs.open_ref(&k, &recorded).err(),
-        Some(SegmentError::Corrupt(
-            "segment does not match the manifest record"
-        ))
+        Some(SegmentError::RefMismatch {
+            id: "seg-0001".into()
+        })
     );
 }
 
@@ -448,4 +450,81 @@ proptest! {
         prop_assert_eq!(&back, &c);
         prop_assert_eq!(back.encode(), bytes);
     }
+}
+
+// ---- Added after the second pre-merge review (PR #8) ----
+
+#[test]
+fn decode_rejects_unknown_fields_at_every_level() {
+    let json = String::from_utf8(sample_content().encode()).unwrap();
+    let tampered = [
+        json.replacen("{", "{\"future_field\":1,", 1),
+        json.replace("\"dimensions\":768", "\"dimensions\":768,\"extra\":true"),
+        json.replace("\"size\":100", "\"size\":100,\"extra\":true"),
+    ];
+    for t in tampered {
+        assert!(
+            matches!(
+                ManifestContent::decode(t.as_bytes(), &keys()),
+                Err(ContentError::Decode(_))
+            ),
+            "must reject: {t}"
+        );
+    }
+}
+
+#[test]
+fn successor_check_costs_exactly_one_extra_get() {
+    fn second_commit_gets(typed: bool) -> (u64, u64) {
+        let store = Arc::new(CountingObjectStore::new(MemObjectStore::new()));
+        let ms = ManifestStore::new(store.clone(), keys()).unwrap();
+        let c = sample_content();
+        let v1 = ms.commit_content(None, 1, &c).unwrap();
+        let before = store.stats();
+        if typed {
+            ms.commit_content(Some(v1), 2, &c).unwrap();
+        } else {
+            ms.commit(Some(v1), 2, &c.encode()).unwrap();
+        }
+        let after = store.stats();
+        (after.gets - before.gets, after.lists - before.lists)
+    }
+    let (raw_gets, raw_lists) = second_commit_gets(false);
+    let (typed_gets, typed_lists) = second_commit_gets(true);
+    assert_eq!(typed_gets, raw_gets + 1, "one GET of the expected version");
+    assert_eq!(typed_lists, raw_lists, "no extra LIST");
+}
+
+#[test]
+fn concurrent_commit_content_loser_gets_commit_conflict() {
+    let ms = ManifestStore::new(Arc::new(MemObjectStore::new()), keys()).unwrap();
+    let v1 = ms.commit_content(None, 1, &sample_content()).unwrap();
+    // Two writers both read v1 and try to commit v2.
+    let mut a = sample_content();
+    a.indexed_through = Some(60);
+    let mut b = sample_content();
+    b.indexed_through = Some(70);
+    ms.commit_content(Some(v1), 2, &a).unwrap();
+    assert_eq!(
+        ms.commit_content(Some(v1), 3, &b).unwrap_err(),
+        ManifestError::CommitConflict
+    );
+    let (_, latest) = ms.load_latest_content().unwrap().unwrap();
+    assert_eq!(
+        latest.indexed_through,
+        Some(60),
+        "the winner's content stands"
+    );
+}
+
+#[test]
+fn commit_content_after_a_missing_expected_version_is_a_conflict() {
+    let ms = ManifestStore::new(Arc::new(MemObjectStore::new()), keys()).unwrap();
+    ms.commit_content(None, 1, &sample_content()).unwrap();
+    assert_eq!(
+        ms.commit_content(Some(seabed_domain::Version::new(5)), 2, &sample_content())
+            .unwrap_err(),
+        ManifestError::CommitConflict
+    );
+    assert_eq!(ms.load_latest().unwrap().unwrap().version.get(), 1);
 }
