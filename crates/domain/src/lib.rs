@@ -170,6 +170,12 @@ impl NamespaceKeys {
         rest.parse::<u64>().ok().map(Version::new)
     }
 
+    /// Pointer object holding the latest committed manifest version (a hint, see the engine).
+    /// It lives outside `manifest_prefix` so listing versions never returns it.
+    pub fn manifest_pointer_key(&self) -> Key {
+        Key::new(format!("{}/manifest-pointer", self.base()))
+    }
+
     pub fn segment_key(&self, segment_id: &str, file: &str) -> Key {
         Key::new(format!("{}/segments/{}/{}", self.base(), segment_id, file))
     }
@@ -228,5 +234,9 @@ mod tests {
         );
         // A WAL key is not a manifest key.
         assert_eq!(k.parse_manifest_version(&k.wal_key(Lsn::new(1))), None);
+        // Neither is the pointer, which is also outside the listed prefix.
+        let ptr = k.manifest_pointer_key();
+        assert_eq!(k.parse_manifest_version(&ptr), None);
+        assert!(!ptr.as_str().starts_with(&k.manifest_prefix()));
     }
 }
