@@ -42,8 +42,34 @@ pub struct WalEntry {
 /// The store is always wrapped in `Retrying`, so transient read failures (`get`, `list`) are
 /// retried with backoff without the caller having to remember it. Writes are not retried by the
 /// wrapper: `append` resolves ambiguous put outcomes itself. Pass a `RetryPolicy` with
-/// `with_retry_policy` to change the read budget; do not wrap the store in `Retrying` yourself,
-/// or retries multiply.
+/// `with_retry_policy` to change the read budget. `Retrying` does not implement `ObjectStore`, so
+/// passing an already-retrying store here does not compile.
+///
+/// A plain store works:
+///
+/// ```
+/// use std::sync::Arc;
+/// use seabed_adapter_objectstore_mem::MemObjectStore;
+/// use seabed_domain::{NamespaceId, NamespaceKeys, TenantId};
+/// use seabed_engine::wal::Wal;
+///
+/// let keys = NamespaceKeys::new(TenantId::new("t").unwrap(), NamespaceId::new("n").unwrap());
+/// let wal = Wal::new(Arc::new(MemObjectStore::new()), keys).unwrap();
+/// ```
+///
+/// The same call with a store that already retries is rejected by the compiler:
+///
+/// ```compile_fail
+/// use std::sync::Arc;
+/// use seabed_adapter_objectstore_mem::MemObjectStore;
+/// use seabed_adapter_objectstore_retry::Retrying;
+/// use seabed_domain::{NamespaceId, NamespaceKeys, TenantId};
+/// use seabed_engine::{wal::Wal, RetryPolicy};
+///
+/// let keys = NamespaceKeys::new(TenantId::new("t").unwrap(), NamespaceId::new("n").unwrap());
+/// let store = Retrying::new(MemObjectStore::new(), RetryPolicy::default());
+/// let wal = Wal::new(Arc::new(store), keys).unwrap();
+/// ```
 pub struct Wal<S: ObjectStore> {
     store: Retrying<Arc<S>>,
     keys: NamespaceKeys,

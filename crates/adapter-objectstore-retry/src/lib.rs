@@ -5,6 +5,11 @@
 //! or may not have been applied, and only the caller (WAL, manifest) knows how to resolve that.
 //!
 //! Retry timing comes from the `backon` crate (exponential backoff with optional jitter).
+//!
+//! `Retrying` deliberately does **not** implement `ObjectStore`. It offers the same methods as
+//! inherent methods instead. Engine components (`Wal`, `ManifestStore`) take a plain
+//! `S: ObjectStore` and wrap it themselves, so handing them a store that already retries is a
+//! compile error rather than a silent multiplication of retries (8 x 8 attempts).
 
 use std::ops::Range;
 use std::time::Duration;
@@ -60,9 +65,21 @@ impl RetryPolicy {
     }
 }
 
-/// Decorator that retries transient read failures of the wrapped store.
+/// Wrapper that retries transient read failures of the wrapped store.
 ///
 /// When the budget runs out, the last `Unavailable` error is returned unchanged.
+///
+/// It cannot be passed where an `ObjectStore` is expected, so it cannot be nested or handed to
+/// a component that already retries:
+///
+/// ```compile_fail
+/// use seabed_adapter_objectstore_mem::MemObjectStore;
+/// use seabed_adapter_objectstore_retry::{RetryPolicy, Retrying};
+/// use seabed_ports::ObjectStore;
+///
+/// fn needs_store(_: impl ObjectStore) {}
+/// needs_store(Retrying::new(MemObjectStore::new(), RetryPolicy::default()));
+/// ```
 pub struct Retrying<S> {
     inner: S,
     policy: RetryPolicy,
@@ -89,28 +106,31 @@ impl<S: ObjectStore> Retrying<S> {
     }
 }
 
-impl<S: ObjectStore> ObjectStore for Retrying<S> {
-    fn caps(&self) -> ObjectStoreCaps {
+// Same signatures as `ObjectStore`, but inherent: see the module docs for why.
+impl<S: ObjectStore> Retrying<S> {
+    pub fn caps(&self) -> ObjectStoreCaps {
         self.inner.caps()
     }
 
-    fn get(&self, key: &Key) -> Result<(Vec<u8>, ETag), StoreError> {
+    pub fn get(&self, key: &Key) -> Result<(Vec<u8>, ETag), StoreError> {
         self.read(|| self.inner.get(key))
     }
 
-    fn get_range(&self, key: &Key, range: Range<u64>) -> Result<Vec<u8>, StoreError> {
+    pub fn get_range(&self, key: &Key, range: Range<u64>) -> Result<Vec<u8>, StoreError> {
         self.read(|| self.inner.get_range(key, range.clone()))
     }
 
-    fn put(&self, key: &Key, data: Vec<u8>, cond: PutCondition) -> Result<ETag, StoreError> {
+    /// Not retried: a failed put may have been applied, and only the caller can resolve that.
+    pub fn put(&self, key: &Key, data: Vec<u8>, cond: PutCondition) -> Result<ETag, StoreError> {
         self.inner.put(key, data, cond)
     }
 
-    fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>, StoreError> {
+    pub fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>, StoreError> {
         self.read(|| self.inner.list(prefix))
     }
 
-    fn delete(&self, key: &Key) -> Result<(), StoreError> {
+    /// Not retried, so the caller sees every outcome.
+    pub fn delete(&self, key: &Key) -> Result<(), StoreError> {
         self.inner.delete(key)
     }
 }

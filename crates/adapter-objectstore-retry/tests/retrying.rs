@@ -5,7 +5,6 @@ use seabed_adapter_objectstore_mem::{
     CountingObjectStore, FaultConfig, FaultInjecting, MemObjectStore,
 };
 use seabed_adapter_objectstore_retry::{RetryPolicy, Retrying};
-use seabed_conformance::run_object_store_suite;
 use seabed_domain::{ETag, Key};
 use seabed_ports::{ObjectMeta, ObjectStore, ObjectStoreCaps, PutCondition, StoreError};
 
@@ -84,8 +83,20 @@ fn seeded(fail_first: usize, err: StoreError) -> Scripted {
 }
 
 #[test]
-fn retrying_store_conforms() {
-    run_object_store_suite(|| Retrying::new(MemObjectStore::new(), RetryPolicy::immediate(3)));
+fn healthy_store_passes_reads_and_writes_through() {
+    let store = Retrying::new(MemObjectStore::new(), RetryPolicy::immediate(3));
+    let k = Key::new("a/1");
+    store.put(&k, b"abc".to_vec(), PutCondition::IfNoneMatch).unwrap();
+    assert_eq!(
+        store.put(&k, b"x".to_vec(), PutCondition::IfNoneMatch).unwrap_err(),
+        StoreError::PreconditionFailed
+    );
+    assert_eq!(store.get(&k).unwrap().0, b"abc");
+    assert_eq!(store.get_range(&k, 0..2).unwrap(), b"ab");
+    assert_eq!(store.list("a/").unwrap().len(), 1);
+    store.delete(&k).unwrap();
+    assert_eq!(store.get(&k).unwrap_err(), StoreError::NotFound);
+    assert!(store.caps().conditional_put);
 }
 
 #[test]

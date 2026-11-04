@@ -31,7 +31,6 @@ version = "0.0.1"
 dependencies = [
  "backon",
  "seabed-adapter-objectstore-mem",
- "seabed-conformance",
  "seabed-domain",
  "seabed-ports",
 ]

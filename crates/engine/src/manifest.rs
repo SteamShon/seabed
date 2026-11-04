@@ -39,8 +39,8 @@ pub struct Manifest {
 /// The store is always wrapped in `Retrying`, so transient read failures (`get`, `list`) are
 /// retried with backoff without the caller having to remember it. Writes are not retried by the
 /// wrapper: `commit` resolves ambiguous put outcomes itself. Pass a `RetryPolicy` with
-/// `with_retry_policy` to change the read budget; do not wrap the store in `Retrying` yourself,
-/// or retries multiply.
+/// `with_retry_policy` to change the read budget. `Retrying` does not implement `ObjectStore`, so
+/// passing an already-retrying store here does not compile.
 pub struct ManifestStore<S: ObjectStore> {
     store: Retrying<Arc<S>>,
     keys: NamespaceKeys,
