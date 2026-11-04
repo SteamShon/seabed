@@ -804,7 +804,10 @@ fn failed_append_after_schema_commit_keeps_the_type_and_retries_cleanly() {
 }
 
 /// The schema commit lands but its response is lost. The writer must recognise its own commit
-/// (same commit id), append exactly once, and commit no second version.
+/// (same commit id), append exactly once, and commit no second version. Without the
+/// recognition the result would look the same after a reload, so the test pins what only the
+/// recognising path does: it advances the pointer to its version (a writer that took the commit
+/// for someone else's would leave the pointer alone).
 #[test]
 fn schema_commit_with_lost_response_adopts_own_commit_and_appends_once() {
     let mem = Arc::new(MemObjectStore::new());
@@ -822,6 +825,12 @@ fn schema_commit_with_lost_response_adopts_own_commit_and_appends_once() {
     n.write(1, &[Op::upsert("a", vec![]).with_attr("size", price(1))])
         .unwrap();
     assert!(ran.load(SeqCst));
+    let (pointer, _) = mem.get(&keys().manifest_pointer_key()).unwrap();
+    assert_eq!(
+        pointer,
+        1u64.to_le_bytes(),
+        "the writer adopted v1 as its own commit and advanced the pointer"
+    );
     let (v, content) = latest_manifest(&mem);
     assert_eq!(v.get(), 1, "one schema version, no second commit");
     assert_eq!(content.attr_schema.get("size"), Some(&AttrKind::I64));
