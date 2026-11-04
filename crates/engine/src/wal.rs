@@ -13,6 +13,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use seabed_adapter_objectstore_retry::{RetryPolicy, Retrying};
 use seabed_domain::{Lsn, NamespaceKeys};
 use seabed_ports::{ObjectStore, PutCondition, StoreError};
 
@@ -38,11 +39,13 @@ pub struct WalEntry {
     pub payload: Vec<u8>,
 }
 
-/// `read_from` and the log-end lookup return transient store errors as they are. Wrap the store
-/// in `seabed_adapter_objectstore_retry::Retrying` to retry them with backoff. `append` resolves
-/// ambiguous writes itself and must see raw `put` outcomes, which `Retrying` passes through.
+/// The store is always wrapped in `Retrying`, so transient read failures (`get`, `list`) are
+/// retried with backoff without the caller having to remember it. Writes are not retried by the
+/// wrapper: `append` resolves ambiguous put outcomes itself. Pass a `RetryPolicy` with
+/// `with_retry_policy` to change the read budget; do not wrap the store in `Retrying` yourself,
+/// or retries multiply.
 pub struct Wal<S: ObjectStore> {
-    store: Arc<S>,
+    store: Retrying<Arc<S>>,
     keys: NamespaceKeys,
     /// Hint for the next free LSN. 0 means unknown.
     next: AtomicU64,
@@ -57,7 +60,7 @@ impl<S: ObjectStore> Wal<S> {
             ));
         }
         Ok(Self {
-            store,
+            store: Retrying::new(store, RetryPolicy::default()),
             keys,
             next: AtomicU64::new(0),
             max_attempts: 10_000,
@@ -66,6 +69,12 @@ impl<S: ObjectStore> Wal<S> {
 
     pub fn with_max_attempts(mut self, n: usize) -> Self {
         self.max_attempts = n;
+        self
+    }
+
+    /// Replaces the read retry policy. `RetryPolicy::immediate(1)` disables read retries.
+    pub fn with_retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.store = Retrying::new(self.store.inner().clone(), policy);
         self
     }
 
