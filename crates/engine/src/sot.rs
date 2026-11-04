@@ -22,7 +22,10 @@
 //!
 //! File key-value metadata carries `seabed.sot.format_version`, `seabed.sot.dims` and
 //! `seabed.sot.parquet_writer` (the real writer version, since `created_by` is fixed). Decoding
-//! requires the first two and checks them.
+//! requires the first two and checks them. Any change to what `encode` writes for the same rows
+//! and schema must bump `SOT_FORMAT_VERSION`: flush derives segment ids from it (see
+//! `namespace`), and an unchanged id with different bytes would make a re-flush fail with
+//! `AlreadyExists`.
 //!
 //! Attribute columns follow the namespace-wide schema stored in the manifest (`AttrSchema`):
 //! `encode` writes every schema column (nullable), so files written at the same schema version

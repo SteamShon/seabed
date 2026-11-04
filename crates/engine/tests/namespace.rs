@@ -1,15 +1,17 @@
 use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering::SeqCst;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use seabed_adapter_objectstore_mem::{FaultConfig, FaultInjecting, MemObjectStore};
-use seabed_domain::{NamespaceId, NamespaceKeys, TenantId};
+use seabed_domain::{ETag, Key, NamespaceId, NamespaceKeys, TenantId, Version};
 use seabed_engine::manifest::{ManifestError, ManifestStore};
 use seabed_engine::manifest_content::AttrKind;
 use seabed_engine::namespace::{Namespace, NamespaceError, Op};
 use seabed_engine::sot::{AttrValue, SotError};
 use seabed_engine::RetryPolicy;
-use seabed_ports::ObjectStore;
+use seabed_ports::{ObjectMeta, ObjectStore, ObjectStoreCaps, PutCondition, StoreError};
 
 const DIMS: u32 = 2;
 
@@ -419,58 +421,86 @@ fn reads_and_flushes_survive_injected_faults() {
     assert_eq!(ns(&mem).read_all().unwrap().len(), 10);
 }
 
-/// Runs a hook once, right before the first LIST of the WAL prefix, so a test can commit a
-/// flush in the middle of another `Namespace`'s read, deterministically.
-struct FlushDuringRead {
-    inner: Arc<MemObjectStore>,
-    wal_prefix: String,
-    hook: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+/// What a put hook decides for one put.
+enum PutAction {
+    /// Pass the put to the inner store.
+    Pass,
+    /// Fail without applying the put.
+    Fail(StoreError),
 }
 
-impl ObjectStore for FlushDuringRead {
-    fn caps(&self) -> seabed_ports::ObjectStoreCaps {
+type GetHook = Box<dyn FnMut(&Key) + Send>;
+type PutHook = Box<dyn FnMut(&Key) -> PutAction + Send>;
+
+/// A `MemObjectStore` view whose GETs and PUTs run test hooks first, so a test can make another
+/// process act at an exact point of an operation, deterministically. Hooks act on the inner
+/// store directly, never through this view.
+struct Hooked {
+    inner: Arc<MemObjectStore>,
+    on_get: Mutex<Option<GetHook>>,
+    on_put: Mutex<Option<PutHook>>,
+}
+
+impl Hooked {
+    fn new(inner: &Arc<MemObjectStore>) -> Arc<Self> {
+        Arc::new(Self {
+            inner: inner.clone(),
+            on_get: Mutex::new(None),
+            on_put: Mutex::new(None),
+        })
+    }
+    fn on_get(&self, hook: impl FnMut(&Key) + Send + 'static) {
+        *self.on_get.lock().unwrap() = Some(Box::new(hook));
+    }
+    fn on_put(&self, hook: impl FnMut(&Key) -> PutAction + Send + 'static) {
+        *self.on_put.lock().unwrap() = Some(Box::new(hook));
+    }
+}
+
+impl ObjectStore for Hooked {
+    fn caps(&self) -> ObjectStoreCaps {
         self.inner.caps()
     }
-    fn get(
-        &self,
-        key: &seabed_domain::Key,
-    ) -> Result<(Vec<u8>, seabed_domain::ETag), seabed_ports::StoreError> {
+    fn get(&self, key: &Key) -> Result<(Vec<u8>, ETag), StoreError> {
+        if let Some(hook) = self.on_get.lock().unwrap().as_mut() {
+            hook(key);
+        }
         self.inner.get(key)
     }
-    fn get_range(
-        &self,
-        key: &seabed_domain::Key,
-        range: std::ops::Range<u64>,
-    ) -> Result<Vec<u8>, seabed_ports::StoreError> {
+    fn get_range(&self, key: &Key, range: std::ops::Range<u64>) -> Result<Vec<u8>, StoreError> {
         self.inner.get_range(key, range)
     }
-    fn put(
-        &self,
-        key: &seabed_domain::Key,
-        data: Vec<u8>,
-        cond: seabed_ports::PutCondition,
-    ) -> Result<seabed_domain::ETag, seabed_ports::StoreError> {
-        self.inner.put(key, data, cond)
-    }
-    fn list(
-        &self,
-        prefix: &str,
-    ) -> Result<Vec<seabed_ports::ObjectMeta>, seabed_ports::StoreError> {
-        if prefix == self.wal_prefix {
-            if let Some(hook) = self.hook.lock().unwrap().take() {
-                hook();
-            }
+    fn put(&self, key: &Key, data: Vec<u8>, cond: PutCondition) -> Result<ETag, StoreError> {
+        let action = match self.on_put.lock().unwrap().as_mut() {
+            Some(hook) => hook(key),
+            None => PutAction::Pass,
+        };
+        match action {
+            PutAction::Pass => self.inner.put(key, data, cond),
+            PutAction::Fail(e) => Err(e),
         }
+    }
+    fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>, StoreError> {
         self.inner.list(prefix)
     }
-    fn delete(&self, key: &seabed_domain::Key) -> Result<(), seabed_ports::StoreError> {
+    fn delete(&self, key: &Key) -> Result<(), StoreError> {
         self.inner.delete(key)
     }
 }
 
+/// True for a manifest version object (not the pointer).
+fn is_manifest_version(key: &Key) -> bool {
+    keys().parse_manifest_version(key).is_some()
+}
+
+fn unavailable() -> StoreError {
+    StoreError::Unavailable("injected".into())
+}
+
 /// Deferred from PR #14 review (M11): a strong read must take its segments and its tail from the
-/// same manifest version. Here a flush commits between the reader's manifest load and its WAL
-/// listing; every write acknowledged before the read must still be returned exactly once.
+/// same manifest version. Here a flush commits right after the reader loaded its manifest (at
+/// the reader's first segment GET); every write acknowledged before the read must still be
+/// returned exactly once, whatever the reader does after that point.
 #[test]
 fn strong_read_sees_every_acked_write_when_a_flush_commits_mid_read() {
     let mem = Arc::new(MemObjectStore::new());
@@ -482,22 +512,18 @@ fn strong_read_sees_every_acked_write_when_a_flush_commits_mid_read() {
         .unwrap();
     writer.write(3, &[Op::upsert("c", vec![])]).unwrap();
 
-    let hooked = Arc::new(FlushDuringRead {
-        inner: mem.clone(),
-        wal_prefix: keys().wal_prefix(),
-        hook: std::sync::Mutex::new(None),
-    });
+    let hooked = Hooked::new(&mem);
     let reader = Namespace::new(hooked.clone(), keys(), DIMS).unwrap();
-    let mem2 = mem.clone();
-    *hooked.hook.lock().unwrap() = Some(Box::new(move || {
-        // Another process flushes b, the delete of a, and c while the read is in progress.
-        assert!(ns(&mem2).flush().unwrap().is_some());
-    }));
+    let ran = Arc::new(AtomicBool::new(false));
+    let (mem2, ran2) = (mem.clone(), ran.clone());
+    hooked.on_get(move |key| {
+        if key.as_str().contains("/segments/") && !ran2.swap(true, SeqCst) {
+            // Another process flushes b, the delete of a, and c while the read is in progress.
+            assert!(ns(&mem2).flush().unwrap().is_some());
+        }
+    });
     let all = reader.read_all().unwrap();
-    assert!(
-        hooked.hook.lock().unwrap().is_none(),
-        "the flush ran mid-read"
-    );
+    assert!(ran.load(SeqCst), "the flush ran mid-read");
     assert_eq!(ids(&all), ["b", "c"]);
     // And a fresh read after the flush agrees.
     assert_eq!(ids(&ns(&mem).read_all().unwrap()), ["b", "c"]);
@@ -529,73 +555,28 @@ fn read_all_request_cost_is_pinned() {
     assert_eq!(after.puts, before.puts, "reads never write");
 }
 
-/// Refuses the next manifest version put once armed, as if another writer had committed first:
-/// the flush wrote its SoT file but never committed (same effect as dying before the commit).
-struct FailNextCommit {
-    inner: Arc<MemObjectStore>,
-    manifest_prefix: String,
-    armed: std::sync::atomic::AtomicBool,
-}
-
-impl ObjectStore for FailNextCommit {
-    fn caps(&self) -> seabed_ports::ObjectStoreCaps {
-        self.inner.caps()
-    }
-    fn get(
-        &self,
-        key: &seabed_domain::Key,
-    ) -> Result<(Vec<u8>, seabed_domain::ETag), seabed_ports::StoreError> {
-        self.inner.get(key)
-    }
-    fn get_range(
-        &self,
-        key: &seabed_domain::Key,
-        range: std::ops::Range<u64>,
-    ) -> Result<Vec<u8>, seabed_ports::StoreError> {
-        self.inner.get_range(key, range)
-    }
-    fn put(
-        &self,
-        key: &seabed_domain::Key,
-        data: Vec<u8>,
-        cond: seabed_ports::PutCondition,
-    ) -> Result<seabed_domain::ETag, seabed_ports::StoreError> {
-        if key.as_str().starts_with(&self.manifest_prefix)
-            && self.armed.swap(false, std::sync::atomic::Ordering::SeqCst)
-        {
-            return Err(seabed_ports::StoreError::PreconditionFailed);
-        }
-        self.inner.put(key, data, cond)
-    }
-    fn list(
-        &self,
-        prefix: &str,
-    ) -> Result<Vec<seabed_ports::ObjectMeta>, seabed_ports::StoreError> {
-        self.inner.list(prefix)
-    }
-    fn delete(&self, key: &seabed_domain::Key) -> Result<(), seabed_ports::StoreError> {
-        self.inner.delete(key)
-    }
-}
-
 /// A flush that wrote its SoT but never committed must not block the next flush of the same WAL
 /// range, even after the schema grew in between (different bytes for the same range). The
 /// segment id's fingerprint keeps the two files apart; the abandoned one is an orphan for GC.
 #[test]
 fn an_uncommitted_flush_does_not_block_a_later_flush_after_the_schema_grew() {
     let mem = Arc::new(MemObjectStore::new());
-    let failing = Arc::new(FailNextCommit {
-        inner: mem.clone(),
-        manifest_prefix: keys().manifest_prefix(),
-        armed: std::sync::atomic::AtomicBool::new(false),
-    });
-    let n = Namespace::new(failing.clone(), keys(), DIMS).unwrap();
+    let hooked = Hooked::new(&mem);
+    let n = Namespace::new(hooked.clone(), keys(), DIMS).unwrap();
     n.write(1, &[Op::upsert("a", vec![]).with_attr("price", price(1))])
         .unwrap();
 
-    failing
-        .armed
-        .store(true, std::sync::atomic::Ordering::SeqCst);
+    // Refuse the flush's commit as if another writer had committed first: the SoT file is
+    // written but never committed (same effect as dying before the commit).
+    let armed = Arc::new(AtomicBool::new(true));
+    let armed2 = armed.clone();
+    hooked.on_put(move |key| {
+        if is_manifest_version(key) && armed2.swap(false, SeqCst) {
+            PutAction::Fail(StoreError::PreconditionFailed)
+        } else {
+            PutAction::Pass
+        }
+    });
     assert_eq!(
         n.flush().unwrap_err(),
         NamespaceError::Manifest(ManifestError::CommitConflict)
@@ -620,4 +601,183 @@ fn an_uncommitted_flush_does_not_block_a_later_flush_after_the_schema_grew() {
     );
     assert_eq!(ids(&n.read_all().unwrap()), ["a"]);
     assert_eq!(segment_objects(&mem).len(), 2, "one orphan, one live file");
+}
+
+fn latest_manifest<S: ObjectStore>(
+    store: &Arc<S>,
+) -> (Version, seabed_engine::manifest_content::ManifestContent) {
+    ManifestStore::new(store.clone(), keys())
+        .unwrap()
+        .load_latest_content()
+        .unwrap()
+        .unwrap()
+}
+
+/// A writer that loses the schema commit race to a writer adding the same type must reload and
+/// succeed, appending exactly once and committing no manifest version of its own.
+#[test]
+fn same_type_new_attr_race_loser_succeeds_after_reload() {
+    let mem = Arc::new(MemObjectStore::new());
+    ns(&mem)
+        .write(
+            1,
+            &[Op::upsert("seed", vec![]).with_attr("price", price(1))],
+        )
+        .unwrap();
+    let (base, _) = latest_manifest(&mem);
+
+    let hooked = Hooked::new(&mem);
+    let loser = Namespace::new(hooked.clone(), keys(), DIMS).unwrap();
+    let ran = Arc::new(AtomicBool::new(false));
+    let (mem2, ran2) = (mem.clone(), ran.clone());
+    hooked.on_put(move |key| {
+        if is_manifest_version(key) && !ran2.swap(true, SeqCst) {
+            // The winner commits the same new attribute type first.
+            ns(&mem2)
+                .write(
+                    2,
+                    &[Op::upsert("w", vec![]).with_attr("size", AttrValue::Str("m".into()))],
+                )
+                .unwrap();
+        }
+        PutAction::Pass
+    });
+    loser
+        .write(
+            3,
+            &[Op::upsert("l", vec![]).with_attr("size", AttrValue::Str("s".into()))],
+        )
+        .unwrap();
+    assert!(ran.load(SeqCst), "the race happened");
+
+    let (v, content) = latest_manifest(&mem);
+    assert_eq!(
+        v.get(),
+        base.get() + 1,
+        "only the winner committed a schema version"
+    );
+    assert_eq!(content.attr_schema.get("size"), Some(&AttrKind::Str));
+    assert_eq!(ids(&ns(&mem).read_all().unwrap()), ["l", "seed", "w"]);
+    assert!(ns(&mem).flush().unwrap().is_some());
+}
+
+/// The schema commit's put reports `Unavailable`, and meanwhile another writer committed a
+/// DIFFERENT type for the same attribute at that version. The writer must not mistake that
+/// commit for its own (commit ids differ by content), so it is refused and appends nothing.
+#[test]
+fn ambiguous_schema_commit_does_not_adopt_a_conflicting_commit() {
+    let mem = Arc::new(MemObjectStore::new());
+    let hooked = Hooked::new(&mem);
+    let a = Namespace::new(hooked.clone(), keys(), DIMS).unwrap();
+    let ran = Arc::new(AtomicBool::new(false));
+    let (mem2, ran2) = (mem.clone(), ran.clone());
+    hooked.on_put(move |key| {
+        if is_manifest_version(key) && !ran2.swap(true, SeqCst) {
+            ns(&mem2)
+                .write(1, &[Op::upsert("b", vec![]).with_attr("size", price(1))])
+                .unwrap();
+            return PutAction::Fail(unavailable());
+        }
+        PutAction::Pass
+    });
+    assert_eq!(
+        a.write(
+            2,
+            &[Op::upsert("a", vec![]).with_attr("size", AttrValue::Str("s".into()))]
+        ),
+        Err(NamespaceError::Invalid(SotError::AttrTypeConflict {
+            name: "size".into()
+        }))
+    );
+    assert!(ran.load(SeqCst));
+    assert_eq!(
+        ids(&ns(&mem).read_all().unwrap()),
+        ["b"],
+        "nothing appended"
+    );
+    assert!(ns(&mem).flush().unwrap().is_some(), "flush is not poisoned");
+}
+
+/// Pins what a write costs: no manifest commit unless the batch adds attributes.
+#[test]
+fn write_request_cost_is_pinned() {
+    use seabed_adapter_objectstore_mem::CountingObjectStore;
+    let store = Arc::new(CountingObjectStore::new(MemObjectStore::new()));
+    let n = Namespace::new(store.clone(), keys(), DIMS).unwrap();
+    n.write(1, &[Op::upsert("a", vec![]).with_attr("price", price(1))])
+        .unwrap();
+    let (v1, _) = latest_manifest(&store);
+
+    let before = store.stats();
+    n.write(2, &[Op::upsert("b", vec![]).with_attr("price", price(2))])
+        .unwrap();
+    let after = store.stats();
+    assert_eq!(
+        after.puts - before.puts,
+        1,
+        "known attributes: one WAL put only"
+    );
+    assert_eq!(
+        latest_manifest(&store).0,
+        v1,
+        "no manifest version for known attributes"
+    );
+
+    let before = store.stats();
+    n.write(
+        3,
+        &[Op::upsert("c", vec![]).with_attr("color", AttrValue::Str("red".into()))],
+    )
+    .unwrap();
+    let after = store.stats();
+    // Manifest version + pointer + WAL entry.
+    assert_eq!(after.puts - before.puts, 3);
+    assert_eq!(
+        latest_manifest(&store).0.get(),
+        v1.get() + 1,
+        "one version per schema extension"
+    );
+}
+
+/// The schema commit lands but the WAL append fails. The write reports the failure, the new
+/// attribute's type stays reserved, a retry with the same request id succeeds once, and flush
+/// still works.
+#[test]
+fn failed_append_after_schema_commit_keeps_the_type_and_retries_cleanly() {
+    let mem = Arc::new(MemObjectStore::new());
+    let hooked = Hooked::new(&mem);
+    let n = Namespace::new(hooked.clone(), keys(), DIMS)
+        .unwrap()
+        .with_retry_policy(RetryPolicy::immediate(2));
+    let wal_down = Arc::new(AtomicBool::new(true));
+    let down = wal_down.clone();
+    let wal_prefix = keys().wal_prefix();
+    hooked.on_put(move |key| {
+        if key.as_str().starts_with(&wal_prefix) && down.load(SeqCst) {
+            PutAction::Fail(unavailable())
+        } else {
+            PutAction::Pass
+        }
+    });
+    let batch = [Op::upsert("a", vec![]).with_attr("size", AttrValue::Str("s".into()))];
+    assert!(matches!(n.write(7, &batch), Err(NamespaceError::Wal(_))));
+
+    let (_, content) = latest_manifest(&mem);
+    assert_eq!(
+        content.attr_schema.get("size"),
+        Some(&AttrKind::Str),
+        "type reserved"
+    );
+    assert!(n.read_all().unwrap().is_empty(), "nothing appended");
+    assert_eq!(
+        n.write(8, &[Op::upsert("x", vec![]).with_attr("size", price(1))]),
+        Err(NamespaceError::Invalid(SotError::AttrTypeConflict {
+            name: "size".into()
+        }))
+    );
+
+    wal_down.store(false, SeqCst);
+    n.write(7, &batch).unwrap();
+    assert_eq!(ids(&n.read_all().unwrap()), ["a"]);
+    assert!(n.flush().unwrap().is_some());
 }

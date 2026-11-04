@@ -18,8 +18,9 @@
 //!
 //! Flushes are safe to retry and to race. The segment id is
 //! `w<first lsn>-<last lsn>-<fingerprint>`, where the fingerprint hashes everything besides the
-//! WAL range that decides the file's bytes: the attribute schema, `dims` and the Parquet writer
-//! version. Identical inputs give the same id and byte-identical files, so `SotStore::write`
+//! WAL range that decides the file's bytes: the attribute schema, `dims`, the SoT format version
+//! and the Parquet writer version. A change to `sot::encode`'s output must bump
+//! `SOT_FORMAT_VERSION` so the fingerprint changes too. Identical inputs give the same id and byte-identical files, so `SotStore::write`
 //! accepts the existing object (retries and same-range races leave one file). Different inputs
 //! (the schema grew between two flushes of one range, or a rolling upgrade changed the writer)
 //! give a different id, so they can never block each other. They may leave an orphan file for GC.
@@ -36,7 +37,9 @@ use sha2::{Digest, Sha256};
 
 use crate::manifest::{ManifestError, ManifestStore};
 use crate::manifest_content::{AttrSchema, ContentError, ManifestContent, SegmentRef};
-use crate::sot::{schema_of, validate_rows, AttrValue, DocRow, SotError, SotStore};
+use crate::sot::{
+    schema_of, validate_rows, AttrValue, DocRow, SotError, SotStore, SOT_FORMAT_VERSION,
+};
 use crate::wal::{Wal, WalError};
 use crate::RetryPolicy;
 
@@ -172,6 +175,7 @@ fn content_commit_id(content: &ManifestContent) -> u64 {
 fn segment_fingerprint(schema: &AttrSchema, dims: u32) -> String {
     let mut input = serde_json::to_vec(schema).expect("schema serializes");
     input.extend_from_slice(&dims.to_le_bytes());
+    input.extend_from_slice(&SOT_FORMAT_VERSION.to_le_bytes());
     input.extend_from_slice(parquet::file::properties::DEFAULT_CREATED_BY.as_bytes());
     sha256(&input)[..4]
         .iter()
@@ -264,6 +268,10 @@ impl<S: ObjectStore> Namespace<S> {
     /// with the namespace schema or with another op in the batch. If the batch adds attributes,
     /// the widened schema is committed first (see the module docs); a concurrent writer that
     /// commits a different type first makes this write fail with `Invalid` after a reload.
+    ///
+    /// A write that fails after the schema commit (for example the WAL append fails) still leaves
+    /// its new attributes in the schema: their types stay reserved. Retrying with the same
+    /// `request_id` is safe.
     pub fn write(&self, request_id: u64, ops: &[Op]) -> Result<Lsn, NamespaceError> {
         if ops.is_empty() {
             return Err(NamespaceError::Invalid(SotError::Format(
@@ -305,8 +313,8 @@ impl<S: ObjectStore> Namespace<S> {
 
     /// Moves the WAL tail into a new segment. Returns `None` when there is nothing to flush.
     ///
-    /// Fails with `Manifest(CommitConflict)` if another flush committed first; call again to
-    /// flush whatever is still unindexed.
+    /// Fails with `Manifest(CommitConflict)` if another manifest commit landed first (another
+    /// flush, or a write adding attributes); call again to flush whatever is still unindexed.
     pub fn flush(&self) -> Result<Option<Flushed>, NamespaceError> {
         let (expected, mut content) = self.latest()?;
         let (tail, last) = self.tail(&content)?;
