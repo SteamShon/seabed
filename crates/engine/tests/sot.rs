@@ -4,12 +4,15 @@ use std::sync::Arc;
 use bytes::Bytes;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use proptest::prelude::*;
-use seabed_adapter_objectstore_mem::{CountingObjectStore, MemObjectStore};
+use seabed_adapter_objectstore_mem::{
+    CountingObjectStore, FaultConfig, FaultInjecting, MemObjectStore,
+};
 use seabed_domain::{NamespaceId, NamespaceKeys, TenantId};
 use seabed_engine::manifest_content::Sha256Hex;
 use seabed_engine::sot::{
     decode, encode, valid_attr_name, AttrValue, DocRow, SotError, SotRef, SotStore, DOCS_FILE,
 };
+use seabed_engine::RetryPolicy;
 use seabed_ports::{ObjectStore, PutCondition};
 
 const DIMS: u32 = 3;
@@ -272,7 +275,7 @@ fn arb_rows() -> impl Strategy<Value = Vec<DocRow>> {
                 Just(protos),
                 proptest::collection::vec(
                     (
-                        any::<u64>(),
+                        0..=i64::MAX as u64,
                         proptest::collection::vec(
                             proptest::collection::vec(-1e6f32..1e6, DIMS as usize),
                             0..3,
@@ -314,53 +317,277 @@ proptest! {
     }
 }
 
-/// Writes a SoT-shaped Parquet file directly with arrow, bypassing `encode`, the way another
-/// tool might. One row, one 3-dim vector.
-fn foreign_file(deleted: bool, vector: [f32; 3]) -> Vec<u8> {
-    use arrow_array::builder::{FixedSizeListBuilder, Float32Builder, ListBuilder};
-    use arrow_array::{ArrayRef, BooleanArray, RecordBatch, StringArray, UInt64Array};
-    use arrow_schema::{DataType, Field, Schema};
+// ---- Files written by other tools: decode must apply the same rules as encode ----
+
+use arrow_array::builder::{FixedSizeListBuilder, Float32Builder, ListBuilder};
+use arrow_array::{ArrayRef, BooleanArray, Int64Array, RecordBatch, StringArray};
+use arrow_schema::{DataType, Field, Schema};
+use parquet::file::metadata::KeyValue;
+
+/// A vectors cell: `None` = null row; inner `None` = null vector; element `None` = null float.
+type VecCell = Option<Vec<Option<Vec<Option<f32>>>>>;
+
+fn vectors_array(rows: &[VecCell]) -> ArrayRef {
     let mut vb = ListBuilder::new(FixedSizeListBuilder::new(Float32Builder::new(), 3));
-    vb.values().values().append_slice(&vector);
-    vb.values().append(true);
-    vb.append(true);
-    let vectors: ArrayRef = Arc::new(vb.finish());
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Utf8, false),
-        Field::new("lsn", DataType::UInt64, false),
-        Field::new("deleted", DataType::Boolean, false),
-        Field::new("vectors", vectors.data_type().clone(), false),
-    ]));
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(StringArray::from(vec!["x"])),
-            Arc::new(UInt64Array::from(vec![1u64])),
-            Arc::new(BooleanArray::from(vec![deleted])),
+    for row in rows {
+        match row {
+            None => vb.append(false),
+            Some(vs) => {
+                for v in vs {
+                    match v {
+                        None => {
+                            for _ in 0..3 {
+                                vb.values().values().append_null();
+                            }
+                            vb.values().append(false);
+                        }
+                        Some(els) => {
+                            for e in els {
+                                vb.values().values().append_option(*e);
+                            }
+                            vb.values().append(true);
+                        }
+                    }
+                }
+                vb.append(true);
+            }
+        }
+    }
+    Arc::new(vb.finish())
+}
+
+/// Builds a SoT-shaped Parquet file with plain arrow, the way another tool might.
+struct Foreign {
+    ids: Vec<Option<&'static str>>,
+    lsns: Vec<i64>,
+    deleted: Vec<bool>,
+    vectors: Vec<VecCell>,
+    extra: Vec<(Field, ArrayRef)>,
+    metadata: Option<Vec<(&'static str, &'static str)>>,
+}
+
+impl Foreign {
+    fn one(vector: [f32; 3]) -> Self {
+        Foreign {
+            ids: vec![Some("x")],
+            lsns: vec![1],
+            deleted: vec![false],
+            vectors: vec![Some(vec![Some(vector.iter().map(|f| Some(*f)).collect())])],
+            extra: vec![],
+            metadata: Some(vec![
+                ("seabed.sot.format_version", "1"),
+                ("seabed.sot.dims", "3"),
+            ]),
+        }
+    }
+
+    fn bytes(self) -> Vec<u8> {
+        let vectors = vectors_array(&self.vectors);
+        let mut fields = vec![
+            Field::new("id", DataType::Utf8, true),
+            Field::new("lsn", DataType::Int64, false),
+            Field::new("deleted", DataType::Boolean, false),
+            Field::new("vectors", vectors.data_type().clone(), true),
+        ];
+        let mut cols: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(self.ids)),
+            Arc::new(Int64Array::from(self.lsns)),
+            Arc::new(BooleanArray::from(self.deleted)),
             vectors,
-        ],
-    )
-    .unwrap();
-    let mut w = parquet::arrow::ArrowWriter::try_new(Vec::new(), schema, None).unwrap();
-    w.write(&batch).unwrap();
-    w.into_inner().unwrap()
+        ];
+        for (f, c) in self.extra {
+            fields.push(f);
+            cols.push(c);
+        }
+        let schema = Arc::new(Schema::new(fields));
+        let batch = RecordBatch::try_new(schema.clone(), cols).unwrap();
+        let props = self.metadata.map(|kv| {
+            parquet::file::properties::WriterProperties::builder()
+                .set_key_value_metadata(Some(
+                    kv.into_iter()
+                        .map(|(k, v)| KeyValue::new(k.to_string(), v.to_string()))
+                        .collect(),
+                ))
+                .build()
+        });
+        let mut w = parquet::arrow::ArrowWriter::try_new(Vec::new(), schema, props).unwrap();
+        w.write(&batch).unwrap();
+        w.into_inner().unwrap()
+    }
+}
+
+fn is_format(r: Result<Vec<DocRow>, SotError>) -> bool {
+    matches!(r, Err(SotError::Format(_)))
 }
 
 #[test]
 fn decode_applies_the_same_rules_to_files_written_by_other_tools() {
     // Sanity: a well-formed foreign file is accepted.
     assert_eq!(
-        decode(&foreign_file(false, [1.0, 2.0, 3.0]), DIMS)
+        decode(&Foreign::one([1.0, 2.0, 3.0]).bytes(), DIMS)
             .unwrap()
             .len(),
         1
     );
     assert!(matches!(
-        decode(&foreign_file(false, [1.0, f32::NAN, 3.0]), DIMS),
+        decode(&Foreign::one([1.0, f32::NAN, 3.0]).bytes(), DIMS),
         Err(SotError::NonFinite { .. })
     ));
+    let mut tomb = Foreign::one([1.0, 2.0, 3.0]);
+    tomb.deleted = vec![true];
     assert!(matches!(
-        decode(&foreign_file(true, [1.0, 2.0, 3.0]), DIMS),
+        decode(&tomb.bytes(), DIMS),
         Err(SotError::TombstoneWithData { .. })
     ));
+}
+
+#[test]
+fn decode_rejects_nulls_inside_vectors_at_every_level() {
+    let cells: [(&str, VecCell); 3] = [
+        (
+            "element",
+            Some(vec![Some(vec![Some(1.0), None, Some(3.0)])]),
+        ),
+        ("vector", Some(vec![None])),
+        ("row", None),
+    ];
+    for (level, cell) in cells {
+        let mut f = Foreign::one([0.0; 3]);
+        f.vectors = vec![cell];
+        assert!(
+            is_format(decode(&f.bytes(), DIMS)),
+            "null {level} must be rejected"
+        );
+    }
+}
+
+#[test]
+fn decode_rejects_nulls_in_fixed_columns() {
+    let mut f = Foreign::one([1.0, 2.0, 3.0]);
+    f.ids = vec![None];
+    assert!(is_format(decode(&f.bytes(), DIMS)));
+}
+
+#[test]
+fn decode_rejects_unsorted_or_duplicate_ids() {
+    for ids in [[Some("b"), Some("a")], [Some("a"), Some("a")]] {
+        let mut f = Foreign::one([1.0, 2.0, 3.0]);
+        f.ids = ids.to_vec();
+        f.lsns = vec![1, 2];
+        f.deleted = vec![true, true];
+        f.vectors = vec![Some(vec![]), Some(vec![])];
+        assert!(is_format(decode(&f.bytes(), DIMS)), "{ids:?}");
+    }
+}
+
+#[test]
+fn decode_rejects_a_bad_attribute_column_name() {
+    let mut f = Foreign::one([1.0, 2.0, 3.0]);
+    f.extra = vec![(
+        Field::new("Color", DataType::Utf8, true),
+        Arc::new(StringArray::from(vec![Some("red")])),
+    )];
+    assert_eq!(
+        decode(&f.bytes(), DIMS).unwrap_err(),
+        SotError::InvalidAttrName("Color".into())
+    );
+}
+
+#[test]
+fn decode_requires_matching_format_version_and_dims_metadata() {
+    let cases = [
+        None,
+        Some(vec![("seabed.sot.dims", "3")]),
+        Some(vec![
+            ("seabed.sot.format_version", "2"),
+            ("seabed.sot.dims", "3"),
+        ]),
+        Some(vec![
+            ("seabed.sot.format_version", "1"),
+            ("seabed.sot.dims", "4"),
+        ]),
+    ];
+    for kv in cases {
+        let mut f = Foreign::one([1.0, 2.0, 3.0]);
+        f.metadata = kv.clone();
+        assert!(is_format(decode(&f.bytes(), DIMS)), "{kv:?}");
+    }
+}
+
+#[test]
+fn decode_rejects_a_negative_lsn() {
+    let mut f = Foreign::one([1.0, 2.0, 3.0]);
+    f.lsns = vec![-1];
+    assert!(is_format(decode(&f.bytes(), DIMS)));
+}
+
+#[test]
+fn file_carries_format_version_dims_and_writer_metadata() {
+    let bytes = encode(&sample(), DIMS).unwrap();
+    let reader = SerializedFileReader::new(Bytes::from(bytes)).unwrap();
+    let kv = reader
+        .metadata()
+        .file_metadata()
+        .key_value_metadata()
+        .unwrap();
+    let get = |k: &str| kv.iter().find(|e| e.key == k).and_then(|e| e.value.clone());
+    assert_eq!(get("seabed.sot.format_version").as_deref(), Some("1"));
+    assert_eq!(get("seabed.sot.dims").as_deref(), Some("3"));
+    assert!(get("seabed.sot.parquet_writer")
+        .unwrap()
+        .starts_with("parquet-rs"));
+}
+
+#[test]
+fn lsn_is_stored_signed_and_must_fit_i64() {
+    let max = DocRow::upsert("a", i64::MAX as u64, vec![]);
+    let back = decode(&encode(std::slice::from_ref(&max), DIMS).unwrap(), DIMS).unwrap();
+    assert_eq!(back, vec![max]);
+    assert_eq!(
+        encode(&[DocRow::upsert("a", i64::MAX as u64 + 1, vec![])], DIMS).unwrap_err(),
+        SotError::LsnOutOfRange { id: "a".into() }
+    );
+}
+
+#[test]
+fn id_of_exactly_max_len_bytes_is_accepted() {
+    let id = format!("{}a", "가".repeat(85)); // 85 * 3 + 1 = 256 bytes
+    assert_eq!(id.len(), 256);
+    let rows = vec![DocRow::upsert(&id, 1, vec![])];
+    assert_eq!(decode(&encode(&rows, DIMS).unwrap(), DIMS).unwrap(), rows);
+}
+
+#[test]
+fn many_rows_spanning_several_record_batches_roundtrip() {
+    let rows: Vec<DocRow> = (0..3000u64)
+        .map(|i| {
+            DocRow::upsert(&format!("id-{i:05}"), i, vec![vec![i as f32, 0.5, -1.0]])
+                .with_attr("n", AttrValue::I64(i as i64))
+        })
+        .collect();
+    let back = decode(&encode(&rows, DIMS).unwrap(), DIMS).unwrap();
+    assert_eq!(back, rows);
+}
+
+#[test]
+fn read_retries_transient_get_failures() {
+    let mem = Arc::new(MemObjectStore::new());
+    let r = SotStore::new(mem.clone())
+        .write(&keys(), "seg-0001", &sample(), DIMS)
+        .unwrap();
+    let cfg = FaultConfig {
+        get_unavailable_ppm: 500_000,
+        ..FaultConfig::none()
+    };
+    let flaky = |policy| {
+        SotStore::new(Arc::new(FaultInjecting::new(mem.clone(), cfg))).with_retry_policy(policy)
+    };
+    // Without retries, half the reads fail.
+    let no_retry = flaky(RetryPolicy::immediate(1));
+    assert!((0..20).any(|_| no_retry.read(&keys(), "seg-0001", &r, DIMS).is_err()));
+    // With retries, all succeed.
+    let retrying = flaky(RetryPolicy::immediate(64));
+    for _ in 0..20 {
+        retrying.read(&keys(), "seg-0001", &r, DIMS).unwrap();
+    }
 }

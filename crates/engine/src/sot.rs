@@ -9,27 +9,41 @@
 //! | column | type | meaning |
 //! | --- | --- | --- |
 //! | `id` | utf8, not null | document id; rows are sorted by it and unique per file |
-//! | `lsn` | uint64, not null | LSN of the write that produced this row (latest wins) |
+//! | `lsn` | int64, not null | LSN of the write that produced this row (latest wins); stored signed
+//! |  |  | because Spark/Hive-family readers handle unsigned 64-bit poorly, so LSNs above `i64::MAX` are refused |
 //! | `deleted` | bool, not null | tombstone: hides older versions of `id` in older segments |
 //! | `vectors` | list<fixed_size_list<f32, dims>>, not null | the document's vectors (empty when deleted) |
 //! | one per attribute | utf8 / int64 / float64 / bool, nullable | absent attribute = null |
 //!
-//! Attribute columns come after the fixed ones, ordered by name. The same rows always encode to
-//! the same bytes: rows are sorted, columns are ordered, and the writer's `created_by` is fixed.
+//! Attribute columns come after the fixed ones, ordered by name. With the same Parquet writer
+//! version, the same rows always encode to the same bytes: rows are sorted, columns are ordered,
+//! and `created_by` is fixed. Across writer versions bytes may differ; that is fine because the
+//! manifest records the hash of the bytes actually written (`SotRef`), not of the rows.
+//!
+//! File key-value metadata carries `seabed.sot.format_version`, `seabed.sot.dims` and
+//! `seabed.sot.parquet_writer` (the real writer version, since `created_by` is fixed). Decoding
+//! requires the first two and checks them.
+//!
+//! Attribute types are inferred per file for now. A namespace-wide attribute schema stored in the
+//! manifest is required before segments are linked into manifests (see PLAN 6.7); without it,
+//! engines reading several files can disagree on a column's type.
+//!
+//! An upsert may have zero vectors (a document with attributes only). `MAX_ID_LEN` counts bytes.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use arrow_array::builder::{FixedSizeListBuilder, Float32Builder, ListBuilder};
 use arrow_array::cast::AsArray;
-use arrow_array::types::{Float32Type, Float64Type, Int64Type, UInt64Type};
+use arrow_array::types::{Float32Type, Float64Type, Int64Type};
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray, UInt64Array,
+    Array, ArrayRef, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray,
 };
 use arrow_schema::{DataType, Field, Schema};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
+use parquet::file::metadata::KeyValue;
 use parquet::file::properties::WriterProperties;
 use seabed_adapter_objectstore_retry::{RetryPolicy, Retrying};
 use seabed_domain::{Key, Lsn, NamespaceKeys};
@@ -43,6 +57,10 @@ use crate::manifest_content::{valid_segment_id, Sha256Hex};
 pub const DOCS_FILE: &str = "docs.parquet";
 pub const MAX_ID_LEN: usize = 256;
 pub const MAX_ATTR_NAME_LEN: usize = 64;
+pub const SOT_FORMAT_VERSION: u32 = 1;
+const KEY_VERSION: &str = "seabed.sot.format_version";
+const KEY_DIMS: &str = "seabed.sot.dims";
+const KEY_WRITER: &str = "seabed.sot.parquet_writer";
 const RESERVED: [&str; 4] = ["id", "lsn", "deleted", "vectors"];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -65,6 +83,10 @@ pub enum SotError {
     },
     /// NaN or infinity in a vector or a float attribute.
     NonFinite {
+        id: String,
+    },
+    /// LSN does not fit the signed 64-bit `lsn` column.
+    LsnOutOfRange {
         id: String,
     },
     /// A tombstone carries vectors or attributes.
@@ -196,6 +218,9 @@ fn validate(rows: &[DocRow], dims: u32) -> Result<BTreeMap<String, AttrType>, So
         if !ids.insert(r.id.as_str()) {
             return Err(SotError::DuplicateDocId(r.id.clone()));
         }
+        if r.lsn.get() > i64::MAX as u64 {
+            return Err(SotError::LsnOutOfRange { id: r.id.clone() });
+        }
         if r.deleted && (!r.vectors.is_empty() || !r.attrs.is_empty()) {
             return Err(SotError::TombstoneWithData { id: r.id.clone() });
         }
@@ -236,8 +261,9 @@ pub fn encode(rows: &[DocRow], dims: u32) -> Result<Vec<u8>, SotError> {
     let ids: ArrayRef = Arc::new(StringArray::from_iter_values(
         sorted.iter().map(|r| r.id.as_str()),
     ));
-    let lsns: ArrayRef = Arc::new(UInt64Array::from_iter_values(
-        sorted.iter().map(|r| r.lsn.get()),
+    // Checked against i64::MAX in `validate`.
+    let lsns: ArrayRef = Arc::new(Int64Array::from_iter_values(
+        sorted.iter().map(|r| r.lsn.get() as i64),
     ));
     let deleted: ArrayRef = Arc::new(BooleanArray::from(
         sorted.iter().map(|r| r.deleted).collect::<Vec<_>>(),
@@ -257,7 +283,7 @@ pub fn encode(rows: &[DocRow], dims: u32) -> Result<Vec<u8>, SotError> {
 
     let mut fields = vec![
         Field::new("id", DataType::Utf8, false),
-        Field::new("lsn", DataType::UInt64, false),
+        Field::new("lsn", DataType::Int64, false),
         Field::new("deleted", DataType::Boolean, false),
         Field::new("vectors", vectors.data_type().clone(), false),
     ];
@@ -309,6 +335,14 @@ pub fn encode(rows: &[DocRow], dims: u32) -> Result<Vec<u8>, SotError> {
     let batch = RecordBatch::try_new(schema.clone(), columns).map_err(format_err)?;
     let props = WriterProperties::builder()
         .set_created_by("seabed".to_string())
+        .set_key_value_metadata(Some(vec![
+            KeyValue::new(KEY_VERSION.to_string(), SOT_FORMAT_VERSION.to_string()),
+            KeyValue::new(KEY_DIMS.to_string(), dims.to_string()),
+            KeyValue::new(
+                KEY_WRITER.to_string(),
+                parquet::file::properties::DEFAULT_CREATED_BY.to_string(),
+            ),
+        ]))
         .set_compression(Compression::SNAPPY)
         .build();
     let mut writer = ArrowWriter::try_new(Vec::new(), schema, Some(props)).map_err(format_err)?;
@@ -318,10 +352,17 @@ pub fn encode(rows: &[DocRow], dims: u32) -> Result<Vec<u8>, SotError> {
 
 /// Decodes and validates a SoT Parquet file. Returns rows sorted by id.
 pub fn decode(bytes: &[u8], dims: u32) -> Result<Vec<DocRow>, SotError> {
-    let reader = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::copy_from_slice(bytes))
-        .map_err(format_err)?
-        .build()
-        .map_err(format_err)?;
+    decode_bytes(bytes::Bytes::copy_from_slice(bytes), dims)
+}
+
+/// Like `decode`, but takes ownership so the store's buffer is not copied again.
+fn decode_bytes(bytes: bytes::Bytes, dims: u32) -> Result<Vec<DocRow>, SotError> {
+    let builder = ParquetRecordBatchReaderBuilder::try_new(bytes).map_err(format_err)?;
+    check_file_metadata(
+        builder.metadata().file_metadata().key_value_metadata(),
+        dims,
+    )?;
+    let reader = builder.build().map_err(format_err)?;
     let mut rows = Vec::new();
     for batch in reader {
         let batch = batch.map_err(format_err)?;
@@ -334,6 +375,27 @@ pub fn decode(bytes: &[u8], dims: u32) -> Result<Vec<DocRow>, SotError> {
     }
     validate(&rows, dims)?;
     Ok(rows)
+}
+
+fn check_file_metadata(kv: Option<&Vec<KeyValue>>, dims: u32) -> Result<(), SotError> {
+    let get = |key: &str| {
+        kv.and_then(|kv| kv.iter().find(|e| e.key == key))
+            .and_then(|e| e.value.clone())
+            .ok_or_else(|| SotError::Format(format!("missing file metadata {key}")))
+    };
+    let version = get(KEY_VERSION)?;
+    if version != SOT_FORMAT_VERSION.to_string() {
+        return Err(SotError::Format(format!(
+            "unsupported SoT format version {version}"
+        )));
+    }
+    let file_dims = get(KEY_DIMS)?;
+    if file_dims != dims.to_string() {
+        return Err(SotError::Format(format!(
+            "file has {file_dims} dimensions, expected {dims}"
+        )));
+    }
+    Ok(())
 }
 
 fn column<'a>(
@@ -358,7 +420,7 @@ fn column<'a>(
 
 fn decode_batch(batch: &RecordBatch, dims: u32, out: &mut Vec<DocRow>) -> Result<(), SotError> {
     let ids = column(batch, "id", &DataType::Utf8)?.as_string::<i32>();
-    let lsns = column(batch, "lsn", &DataType::UInt64)?.as_primitive::<UInt64Type>();
+    let lsns = column(batch, "lsn", &DataType::Int64)?.as_primitive::<Int64Type>();
     let deleted = column(batch, "deleted", &DataType::Boolean)?.as_boolean();
     let vec_col = batch
         .column_by_name("vectors")
@@ -371,10 +433,13 @@ fn decode_batch(batch: &RecordBatch, dims: u32, out: &mut Vec<DocRow>) -> Result
         .as_fixed_size_list_opt()
         .filter(|f| f.value_length() == dims as i32)
         .ok_or_else(|| SotError::Format(format!("vectors are not fixed-size lists of {dims}")))?;
-    let floats = inner
-        .values()
-        .as_primitive_opt::<Float32Type>()
-        .ok_or_else(|| SotError::Format("vector elements are not f32".into()))?;
+    if inner.values().as_primitive_opt::<Float32Type>().is_none() {
+        return Err(SotError::Format("vector elements are not f32".into()));
+    }
+    // Nulls at any level would otherwise read as whatever bytes sit in the null slots.
+    if lists.null_count() > 0 || inner.null_count() > 0 || inner.values().null_count() > 0 {
+        return Err(SotError::Format("null inside column vectors".into()));
+    }
 
     let mut attrs: Vec<(String, AttrType, &ArrayRef)> = Vec::new();
     for (field, col) in batch.schema().fields().iter().zip(batch.columns()) {
@@ -391,11 +456,13 @@ fn decode_batch(batch: &RecordBatch, dims: u32, out: &mut Vec<DocRow>) -> Result
     }
 
     for i in 0..batch.num_rows() {
-        let mut vectors = Vec::new();
-        let (start, end) = (lists.value_offsets()[i], lists.value_offsets()[i + 1]);
-        for v in start..end {
-            let base = (v as usize) * dims as usize;
-            vectors.push(floats.values()[base..base + dims as usize].to_vec());
+        // Go through the array accessors, which respect slice offsets, not raw buffers.
+        let row_vectors = lists.value(i);
+        let row_vectors = row_vectors.as_fixed_size_list();
+        let mut vectors = Vec::with_capacity(row_vectors.len());
+        for v in 0..row_vectors.len() {
+            let one = row_vectors.value(v);
+            vectors.push(one.as_primitive::<Float32Type>().values().to_vec());
         }
         let mut row_attrs = BTreeMap::new();
         for (name, t, col) in &attrs {
@@ -412,7 +479,10 @@ fn decode_batch(batch: &RecordBatch, dims: u32, out: &mut Vec<DocRow>) -> Result
         }
         out.push(DocRow {
             id: ids.value(i).to_string(),
-            lsn: Lsn::new(lsns.value(i)),
+            lsn: Lsn::new(
+                u64::try_from(lsns.value(i))
+                    .map_err(|_| SotError::Format("negative lsn".into()))?,
+            ),
             deleted: deleted.value(i),
             vectors,
             attrs: row_attrs,
@@ -492,6 +562,6 @@ impl<S: ObjectStore> SotStore<S> {
         if bytes.len() as u64 != recorded.size || sha256(&bytes) != recorded.sha256.0 {
             return Err(SotError::RefMismatch);
         }
-        decode(&bytes, dims)
+        decode_bytes(bytes::Bytes::from(bytes), dims)
     }
 }
