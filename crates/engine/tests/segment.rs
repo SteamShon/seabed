@@ -32,7 +32,7 @@ fn put_raw(mem: &MemObjectStore, bytes: Vec<u8>) {
 fn roundtrip_reads_every_section() {
     let mem = Arc::new(MemObjectStore::new());
     let segs = SegmentStore::new(mem).unwrap();
-    let size = segs.write(&key(), &sample()).unwrap();
+    let size = segs.write(&key(), &sample()).unwrap().size;
 
     let r = segs.open(&key(), size).unwrap();
     let names: Vec<_> = r.sections().iter().map(|s| s.name.as_str()).collect();
@@ -65,7 +65,7 @@ fn encoding_is_deterministic_regardless_of_insertion_order() {
 #[test]
 fn empty_segment_is_valid() {
     let segs = SegmentStore::new(Arc::new(MemObjectStore::new())).unwrap();
-    let size = segs.write(&key(), &SegmentBuilder::new()).unwrap();
+    let size = segs.write(&key(), &SegmentBuilder::new()).unwrap().size;
     assert_eq!(size, (4 + FOOTER_LEN) as u64);
     assert!(segs.open(&key(), size).unwrap().sections().is_empty());
 }
@@ -102,7 +102,7 @@ fn builder_rejects_bad_and_duplicate_names() {
 fn open_costs_one_get_when_the_toc_fits_in_the_tail() {
     let store = Arc::new(CountingObjectStore::new(MemObjectStore::new()));
     let segs = SegmentStore::new(store.clone()).unwrap();
-    let size = segs.write(&key(), &sample()).unwrap();
+    let size = segs.write(&key(), &sample()).unwrap().size;
 
     let before = store.stats();
     let r = segs.open(&key(), size).unwrap();
@@ -131,7 +131,7 @@ fn large_toc_needs_a_second_get() {
     }
     let store = Arc::new(CountingObjectStore::new(MemObjectStore::new()));
     let segs = SegmentStore::new(store.clone()).unwrap();
-    let size = segs.write(&key(), &b).unwrap();
+    let size = segs.write(&key(), &b).unwrap().size;
     assert!(size > TAIL_HINT);
 
     let before = store.stats();
@@ -208,7 +208,7 @@ fn bad_magic_and_unknown_version_are_rejected() {
 fn wrong_recorded_size_is_an_error() {
     let mem = Arc::new(MemObjectStore::new());
     let segs = SegmentStore::new(mem).unwrap();
-    let size = segs.write(&key(), &sample()).unwrap();
+    let size = segs.write(&key(), &sample()).unwrap().size;
     assert!(segs.open(&key(), size - 1).is_err());
     assert!(segs.open(&key(), size + 1).is_err());
     assert!(segs.open(&key(), 3).is_err());

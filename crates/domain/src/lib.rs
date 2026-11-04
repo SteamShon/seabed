@@ -138,6 +138,14 @@ impl NamespaceKeys {
         Self { tenant, namespace }
     }
 
+    pub fn tenant(&self) -> &TenantId {
+        &self.tenant
+    }
+
+    pub fn namespace(&self) -> &NamespaceId {
+        &self.namespace
+    }
+
     fn base(&self) -> String {
         format!("t/{}/n/{}", self.tenant, self.namespace)
     }

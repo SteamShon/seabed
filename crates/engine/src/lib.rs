@@ -1,6 +1,7 @@
 //! Application services that depend on ports only.
 
 pub mod manifest;
+pub mod manifest_content;
 pub mod segment;
 pub mod wal;
 

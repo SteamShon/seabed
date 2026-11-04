@@ -120,6 +120,7 @@ v0.5 · 2026-11-04 · 대화에서 합의한 내용 기준. v0.5는 계획 리�
 - segment 파일 끝에 footer TOC(섹션 오프셋, 길이, SHA-256, 포맷 버전). 끝부분을 range GET으로 읽어 TOC를 얻고 필요한 섹션만 읽는다. 같은 입력이면 같은 바이트(결정성).
 - 구현(M1): `seabed_engine::segment`. 섹션 이름순 배치, TOC 항목마다 SHA-256, footer에 TOC SHA-256·포맷 버전·magic. 크기는 manifest가 기록한다는 전제로 호출자가 넘긴다(HEAD 요청 없음). 끝 4KB를 한 번에 읽어 TOC가 들어 있으면 GET 1회로 열린다.
 - manifest에 `IndexBinding`(임베딩 모델 id, 차원, 거리 지표, 양자화, 토크나이저 id와 사전 버전)을 기록하고 불일치하면 즉시 실패.
+- 구현(M1): manifest payload는 `seabed_engine::manifest_content::ManifestContent`(JSON, 필드 순서 고정이라 결정적). tenant·namespace, `indexed_through`(이 LSN까지는 segment에 있고 그 뒤가 미인덱싱 꼬리), `IndexBinding`(처음 쓴 값으로 고정, 다른 값이면 어느 필드가 다른지와 함께 실패), segment 목록(id, 크기, TOC SHA-256)을 담는다. `SegmentStore::open_ref`는 기록된 TOC 해시와 실제 객체를 비교한다.
 
 ### 6.6 텍스트(BM25)
 
@@ -158,7 +159,7 @@ v0.5 · 2026-11-04 · 대화에서 합의한 내용 기준. v0.5는 계획 리�
 
 **최소 검증 경로 [제안]:** 혼자 개발하는 규모를 고려해, 가설 검증에 꼭 필요한 M1 → M2(정적 빌드) → M3(필터 플래너) → M4(bulk 분리) → M4.5를 먼저 끝낸다. BM25/한국어, OLAP 노출, FDE, 증분 클러스터 갱신의 고도화는 그 뒤로 미룰 수 있다.
 
-현재 상태: M1의 일부(ObjectStore 포트와 메모리 어댑터, 장애 주입, WAL, manifest 커밋, conformance)만 코드가 있다. 2026-11-04 기준 `cargo test --workspace`가 컴파일되고 모든 테스트가 통과한다. 최신 manifest 포인터(`If-Match` 전진 + 앞으로 탐색, 읽기 GET 약 3회)가 있다.
+현재 상태: M1의 일부(ObjectStore 포트와 메모리 어댑터, 장애 주입, WAL, manifest 커밋, conformance)만 코드가 있다. 2026-11-04 기준 `cargo test --workspace`가 컴파일되고 모든 테스트가 통과한다. 최신 manifest 포인터(`If-Match` 전진 + 앞으로 탐색, 읽기 GET 약 3회)가 있다. segment 포맷과 타입이 있는 manifest 내용(segment 목록, `indexed_through`, `IndexBinding`)이 있다. M1에 남은 것은 컬럼형 SoT와 미인덱싱 꼬리 검색이다.
 
 ## 8. 평가(M0) 요약
 

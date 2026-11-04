@@ -19,6 +19,8 @@ use seabed_adapter_objectstore_retry::{RetryPolicy, Retrying};
 use seabed_domain::{ETag, NamespaceKeys, Version};
 use seabed_ports::{ObjectStore, PutCondition, StoreError};
 
+use crate::manifest_content::{ContentError, ManifestContent};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManifestError {
     Store(StoreError),
@@ -28,6 +30,8 @@ pub enum ManifestError {
     Corrupt(Version),
     /// The pointer object does not hold an 8-byte version.
     CorruptPointer,
+    /// The payload is not valid `ManifestContent` for this namespace.
+    Content(ContentError),
     TooManyAttempts,
 }
 
@@ -94,6 +98,31 @@ impl<S: ObjectStore> ManifestStore<S> {
             Err(StoreError::NotFound) => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Latest version decoded as `ManifestContent` and checked against this namespace.
+    pub fn load_latest_content(&self) -> Result<Option<(Version, ManifestContent)>, ManifestError> {
+        match self.load_latest()? {
+            Some(m) => {
+                let c = ManifestContent::decode(&m.payload, &self.keys)
+                    .map_err(ManifestError::Content)?;
+                Ok(Some((m.version, c)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Commits typed content. It is validated the same way readers validate it, so a manifest
+    /// that readers would reject (wrong namespace, duplicate segment) is never written.
+    pub fn commit_content(
+        &self,
+        expected: Option<Version>,
+        commit_id: u64,
+        content: &ManifestContent,
+    ) -> Result<Version, ManifestError> {
+        let bytes = content.encode();
+        ManifestContent::decode(&bytes, &self.keys).map_err(ManifestError::Content)?;
+        self.commit(expected, commit_id, &bytes)
     }
 
     pub fn load_latest(&self) -> Result<Option<Manifest>, ManifestError> {
