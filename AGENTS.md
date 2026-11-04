@@ -22,6 +22,12 @@
   ```
 - 머지 전 CI가 통과해야 합니다. 테스트를 끄거나 건너뛰어 통과시키지 않습니다.
 
+## 검사
+
+- push와 PR 전에 `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`를 모두 통과시킵니다. CI도 같은 검사를 합니다.
+- 포맷은 rustfmt 기본값(`rustfmt.toml`)입니다. 설정을 임의로 바꾸지 않습니다.
+- 포맷만 바뀐 변경은 기능 변경과 다른 커밋으로 둡니다.
+
 ## 커밋
 
 - 제목은 `<종류>: <요약>` 형식입니다(`feat`, `fix`, `docs`, `refactor`, `test`, `chore`).
