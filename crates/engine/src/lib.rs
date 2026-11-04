@@ -2,6 +2,7 @@
 
 pub mod manifest;
 pub mod manifest_content;
+pub mod namespace;
 pub mod segment;
 pub mod sot;
 pub mod wal;
