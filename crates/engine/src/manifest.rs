@@ -68,16 +68,34 @@ impl<S: ObjectStore> ManifestStore<S> {
         })
     }
 
+    /// Runs a read, retrying transient `Unavailable` errors. Reads have no side effects, so a
+    /// retry is always safe; other errors are returned at once.
+    fn read_with_retry<T>(
+        &self,
+        mut op: impl FnMut() -> Result<T, StoreError>,
+    ) -> Result<T, ManifestError> {
+        let mut last = None;
+        for _ in 0..self.max_attempts {
+            match op() {
+                Err(e @ StoreError::Unavailable(_)) => last = Some(e),
+                other => return other.map_err(Into::into),
+            }
+        }
+        Err(last.map_or(ManifestError::TooManyAttempts, Into::into))
+    }
+
     pub fn load(&self, version: Version) -> Result<Option<Manifest>, ManifestError> {
-        match self.store.get(&self.keys.manifest_key(version)) {
+        let key = self.keys.manifest_key(version);
+        match self.read_with_retry(|| self.store.get(&key)) {
             Ok((bytes, _)) => Ok(Some(Self::parse(version, &bytes)?)),
-            Err(StoreError::NotFound) => Ok(None),
-            Err(e) => Err(e.into()),
+            Err(ManifestError::Store(StoreError::NotFound)) => Ok(None),
+            Err(e) => Err(e),
         }
     }
 
     pub fn load_latest(&self) -> Result<Option<Manifest>, ManifestError> {
-        let metas = self.store.list(&self.keys.manifest_prefix())?;
+        let prefix = self.keys.manifest_prefix();
+        let metas = self.read_with_retry(|| self.store.list(&prefix))?;
         let latest = metas
             .iter()
             .filter_map(|m| self.keys.parse_manifest_version(&m.key))
