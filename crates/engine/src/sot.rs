@@ -543,8 +543,8 @@ fn sha256(data: &[u8]) -> [u8; 32] {
     Sha256::digest(data).into()
 }
 
-/// Writes and reads SoT files. Reads are retried like the other stores; the create-only write
-/// is not.
+/// Writes and reads SoT files. Reads are retried like the other stores. Writes are create-only:
+/// `write` retries an unclear put itself and accepts the key only if it holds the same bytes.
 pub struct SotStore<S: ObjectStore> {
     store: Retrying<Arc<S>>,
 }
