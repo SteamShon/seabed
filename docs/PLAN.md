@@ -129,7 +129,11 @@ v0.5 · 2026-11-04 · 대화에서 합의한 내용 기준. v0.5는 계획 리�
 
 ### 6.7 OLAP
 
-자체 조인 엔진을 만들지 않는다. SoT를 표준 컬럼너 포맷과 스냅샷 메타데이터로 노출해 외부 엔진이 읽게 한다. 실제 분석 패턴은 불확실(조인 + group by 배치로 추정)이라 M5에서 확정.
+자체 조인 엔진을 만들지 않는다. SoT를 표준 컬럼너 포맷과 스냅샷 메타데이터로 노출해 외부 엔진이 읽게 한다.
+
+구현(M1): `seabed_engine::sot`. segment마다 `segments/<id>/docs.parquet`를 둔다. 이 파일은 seabed 컨테이너(`.sbsg`) 안이 아니라 독립된 Parquet 객체라서 DuckDB 같은 외부 엔진이 그대로 읽는다. 컬럼은 `id`, `lsn`, `deleted`(tombstone), `vectors`(list<fixed_size_list<f32, dims>>), 속성마다 nullable 컬럼(utf8/int64/float64/bool) 하나씩이다. 행은 id 순으로 정렬되고 id가 겹치지 않는다. 같은 Parquet writer 버전이면 같은 행은 같은 바이트로 인코딩된다. writer 버전이 바뀌면 바이트가 달라질 수 있으며, manifest는 실제로 쓴 바이트의 크기와 SHA-256을 기록한다. 파일 메타데이터에 `seabed.sot.format_version`과 `seabed.sot.dims`를 기록하고 읽을 때 확인한다. `lsn`은 Spark 등 외부 엔진 호환을 위해 int64로 저장한다(`i64::MAX` 초과 거부). manifest의 segment 목록에 SoT 파일을 연결하는 일과 미인덱싱 꼬리 병합은 다음 작업이다.
+
+**[결정] 다음 PR(manifest 연결)의 선행 조건: namespace 단위 속성 스키마.** 지금은 파일마다 속성 타입을 추론한다. 그래서 DuckDB가 여러 segment를 glob으로 읽으면 첫 파일 스키마를 따라 값이 바뀌거나 열이 경고 없이 사라질 수 있다(PR #11 리뷰에서 확인). manifest에 속성 이름→타입을 두고(추가만 허용), encode가 그 스키마의 모든 열을 항상 쓰고 decode가 기대 스키마와 비교하게 한다. 외부 엔진은 glob이 아니라 manifest의 파일 목록을 읽어야 스냅샷이 된다. 실제 분석 패턴은 불확실(조인 + group by 배치로 추정)이라 M5에서 확정.
 
 ### 6.8 포트 후보
 
@@ -159,7 +163,7 @@ v0.5 · 2026-11-04 · 대화에서 합의한 내용 기준. v0.5는 계획 리�
 
 **최소 검증 경로 [제안]:** 혼자 개발하는 규모를 고려해, 가설 검증에 꼭 필요한 M1 → M2(정적 빌드) → M3(필터 플래너) → M4(bulk 분리) → M4.5를 먼저 끝낸다. BM25/한국어, OLAP 노출, FDE, 증분 클러스터 갱신의 고도화는 그 뒤로 미룰 수 있다.
 
-현재 상태: M1의 일부(ObjectStore 포트와 메모리 어댑터, 장애 주입, WAL, manifest 커밋, conformance)만 코드가 있다. 2026-11-04 기준 `cargo test --workspace`가 컴파일되고 모든 테스트가 통과한다. 최신 manifest 포인터(`If-Match` 전진 + 앞으로 탐색, 읽기 GET 약 3회)가 있다. segment 포맷과 타입이 있는 manifest 내용(segment 목록, `indexed_through`, `IndexBinding`)이 있다. M1에 남은 것은 컬럼형 SoT와 미인덱싱 꼬리 검색이다.
+현재 상태: M1의 일부(ObjectStore 포트와 메모리 어댑터, 장애 주입, WAL, manifest 커밋, conformance)만 코드가 있다. 2026-11-04 기준 `cargo test --workspace`가 컴파일되고 모든 테스트가 통과한다. 최신 manifest 포인터(`If-Match` 전진 + 앞으로 탐색, 읽기 GET 약 3회)가 있다. segment 포맷과 타입이 있는 manifest 내용(segment 목록, `indexed_through`, `IndexBinding`)이 있다. Parquet SoT 파일(쓰기·읽기·검증)이 있다. M1에 남은 것은 manifest에 SoT 연결과 미인덱싱 꼬리 병합 읽기다.
 
 ## 8. 평가(M0) 요약
 
