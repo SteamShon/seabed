@@ -22,9 +22,11 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use seabed_adapter_objectstore_retry::{RetryPolicy, Retrying};
-use seabed_domain::Key;
+use seabed_domain::{Key, NamespaceKeys};
 use seabed_ports::{ObjectStore, PutCondition, StoreError};
 use sha2::{Digest, Sha256};
+
+use crate::manifest_content::{valid_segment_id, SegmentRef, Sha256Hex};
 
 pub const FORMAT_VERSION: u16 = 1;
 pub const MAGIC: [u8; 4] = *b"SBSG";
@@ -33,6 +35,8 @@ pub const FOOTER_LEN: usize = 4 + 32 + 2 + 4;
 /// How many tail bytes `open` reads in its first request. A TOC that fits costs one GET.
 pub const TAIL_HINT: u64 = 4096;
 pub const MAX_NAME_LEN: usize = 255;
+/// File name of a segment inside `segments/<id>/`.
+pub const DATA_FILE: &str = "data.sbsg";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SegmentError {
@@ -40,6 +44,14 @@ pub enum SegmentError {
     /// A segment already exists at this key. Segments are immutable.
     AlreadyExists,
     InvalidName(String),
+    /// The segment id would not be accepted by the manifest (or could escape the namespace's
+    /// key prefix). Checked before anything is written.
+    InvalidSegmentId(String),
+    /// The object at a manifest-listed segment's key is not the one the manifest recorded
+    /// (different TOC hash): it was replaced, not damaged. Distinct from `Corrupt`.
+    RefMismatch {
+        id: String,
+    },
     DuplicateSection(String),
     MissingSection(String),
     UnsupportedVersion(u16),
@@ -53,6 +65,13 @@ impl From<StoreError> for SegmentError {
     fn from(e: StoreError) -> Self {
         SegmentError::Store(e)
     }
+}
+
+/// What `write` stored: the values the manifest records about a segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Written {
+    pub size: u64,
+    pub toc_sha256: [u8; 32],
 }
 
 fn sha256(data: &[u8]) -> [u8; 32] {
@@ -191,16 +210,52 @@ impl<S: ObjectStore> SegmentStore<S> {
         self
     }
 
-    /// Creates the segment at `key` and returns its size in bytes (to record in the manifest).
-    /// Fails with `AlreadyExists` if anything is already there: segments are never overwritten.
-    pub fn write(&self, key: &Key, segment: &SegmentBuilder) -> Result<u64, SegmentError> {
+    /// Creates the segment at `key` and returns its size and TOC hash (to record in the
+    /// manifest). Fails with `AlreadyExists` if anything is already there: segments are never
+    /// overwritten.
+    pub fn write(&self, key: &Key, segment: &SegmentBuilder) -> Result<Written, SegmentError> {
         let bytes = segment.encode();
         let size = bytes.len() as u64;
+        let footer = &bytes[bytes.len() - FOOTER_LEN..];
+        let toc_sha256: [u8; 32] = footer[4..36].try_into().unwrap();
         match self.store.put(key, bytes, PutCondition::IfNoneMatch) {
-            Ok(_) => Ok(size),
+            Ok(_) => Ok(Written { size, toc_sha256 }),
             Err(StoreError::PreconditionFailed) => Err(SegmentError::AlreadyExists),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Writes segment `id` of the namespace and returns the reference to add to the manifest.
+    pub fn write_segment(
+        &self,
+        keys: &NamespaceKeys,
+        id: &str,
+        segment: &SegmentBuilder,
+    ) -> Result<SegmentRef, SegmentError> {
+        if !valid_segment_id(id) {
+            return Err(SegmentError::InvalidSegmentId(id.to_string()));
+        }
+        let w = self.write(&keys.segment_key(id, DATA_FILE), segment)?;
+        Ok(SegmentRef {
+            id: id.to_string(),
+            size: w.size,
+            toc_sha256: Sha256Hex(w.toc_sha256),
+        })
+    }
+
+    /// Opens a segment listed in the manifest and checks that the object is the one recorded.
+    pub fn open_ref(
+        &self,
+        keys: &NamespaceKeys,
+        segment: &SegmentRef,
+    ) -> Result<SegmentReader<'_, S>, SegmentError> {
+        let reader = self.open(&keys.segment_key(&segment.id, DATA_FILE), segment.size)?;
+        if reader.toc_sha256 != segment.toc_sha256.0 {
+            return Err(SegmentError::RefMismatch {
+                id: segment.id.clone(),
+            });
+        }
+        Ok(reader)
     }
 
     /// Reads the footer and TOC. `size` is the object size recorded when it was written.
@@ -244,6 +299,7 @@ impl<S: ObjectStore> SegmentStore<S> {
             store: &self.store,
             key: key.clone(),
             sections,
+            toc_sha256: toc_sha,
         })
     }
 }
@@ -253,9 +309,14 @@ pub struct SegmentReader<'a, S: ObjectStore> {
     store: &'a Retrying<Arc<S>>,
     key: Key,
     sections: Vec<SectionInfo>,
+    toc_sha256: [u8; 32],
 }
 
 impl<S: ObjectStore> SegmentReader<'_, S> {
+    pub fn toc_sha256(&self) -> [u8; 32] {
+        self.toc_sha256
+    }
+
     /// Sections in name order.
     pub fn sections(&self) -> &[SectionInfo] {
         &self.sections
