@@ -2,9 +2,12 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::thread;
 
-use seabed_adapter_objectstore_mem::{CountingObjectStore, FaultConfig, FaultInjecting, MemObjectStore};
+use seabed_adapter_objectstore_mem::{
+    CountingObjectStore, FaultConfig, FaultInjecting, MemObjectStore,
+};
 use seabed_domain::{Lsn, NamespaceId, NamespaceKeys, TenantId};
 use seabed_engine::wal::Wal;
+use seabed_engine::RetryPolicy;
 
 fn keys() -> NamespaceKeys {
     NamespaceKeys::new(
@@ -74,9 +77,12 @@ fn lost_responses_do_not_duplicate_or_lose_entries() {
         put_lose_response_ppm: 200_000,
         put_conflict_ppm: 50_000,
         get_unavailable_ppm: 100_000,
+        list_unavailable_ppm: 100_000,
     };
     let faulty = Arc::new(FaultInjecting::new(mem.clone(), cfg));
-    let wal = Wal::new(faulty, keys()).unwrap();
+    let wal = Wal::new(faulty, keys())
+        .unwrap()
+        .with_retry_policy(RetryPolicy::immediate(32));
 
     thread::scope(|sc| {
         for t in 0..4u64 {
@@ -95,7 +101,11 @@ fn lost_responses_do_not_duplicate_or_lose_entries() {
     let entries = clean.read_from(Lsn::new(1)).unwrap();
     let mut seen = HashSet::new();
     for e in &entries {
-        assert!(seen.insert(e.request_id), "duplicate request_id {}", e.request_id);
+        assert!(
+            seen.insert(e.request_id),
+            "duplicate request_id {}",
+            e.request_id
+        );
     }
     assert_eq!(seen.len(), 100, "no append may be lost");
     assert_eq!(entries.len(), 100);
@@ -112,4 +122,53 @@ fn request_counts_are_observable() {
     // One list to find the log end, then one successful put per append.
     assert_eq!(stats.puts, 10);
     assert_eq!(stats.lists, 1);
+}
+
+#[test]
+fn reads_survive_injected_read_faults_with_built_in_retries() {
+    let mem = Arc::new(MemObjectStore::new());
+    let writer = Wal::new(mem.clone(), keys()).unwrap();
+    for i in 1..=30u64 {
+        writer.append(i, &i.to_le_bytes()).unwrap();
+    }
+
+    let cfg = FaultConfig {
+        seed: 9,
+        get_unavailable_ppm: 200_000,
+        list_unavailable_ppm: 200_000,
+        ..FaultConfig::none()
+    };
+
+    // With retries disabled, injected faults surface to the caller.
+    let raw = Wal::new(Arc::new(FaultInjecting::new(mem.clone(), cfg)), keys())
+        .unwrap()
+        .with_retry_policy(RetryPolicy::immediate(1));
+    assert!((0..20).any(|_| raw.read_from(Lsn::new(1)).is_err()));
+
+    // Retries are built in; only the policy is swapped for one that does not sleep.
+    let reader = Wal::new(Arc::new(FaultInjecting::new(mem, cfg)), keys())
+        .unwrap()
+        .with_retry_policy(RetryPolicy::immediate(32));
+    for _ in 0..20 {
+        let entries = reader.read_from(Lsn::new(1)).unwrap();
+        assert_eq!(entries.len(), 30);
+    }
+}
+
+#[test]
+fn default_constructor_retries_reads_without_extra_wiring() {
+    let mem = Arc::new(MemObjectStore::new());
+    let writer = Wal::new(mem.clone(), keys()).unwrap();
+    for i in 1..=10u64 {
+        writer.append(i, &i.to_le_bytes()).unwrap();
+    }
+    let cfg = FaultConfig {
+        seed: 3,
+        get_unavailable_ppm: 100_000,
+        list_unavailable_ppm: 100_000,
+        ..FaultConfig::none()
+    };
+    // No retry policy, no decorator: the default policy (with backoff) applies.
+    let reader = Wal::new(Arc::new(FaultInjecting::new(mem, cfg)), keys()).unwrap();
+    assert_eq!(reader.read_from(Lsn::new(1)).unwrap().len(), 10);
 }

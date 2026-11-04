@@ -23,6 +23,26 @@
 - 환경이 브랜치 이름을 지정하면(예: `claude/...`) 그 이름을 그대로 씁니다.
 - 이미 머지된 PR의 브랜치에는 새 작업을 쌓지 않습니다. 최신 `develop`에서 다시 따고, 같은 이름이면 `git checkout -B`로 재설정합니다. 머지되지 않은 커밋이 남아 있으면 버리지 말고 새 base 위로 rebase합니다.
 
+## 로컬 검사
+
+PR을 열기 전과 push 전에 다음 세 가지를 통과시킵니다. CI(`.github/workflows/ci.yml`)도 같은 검사를 합니다.
+
+```bash
+cargo fmt --all
+```
+
+```bash
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
+```bash
+cargo test --workspace
+```
+
+- 포맷은 rustfmt 기본값을 따릅니다(`rustfmt.toml`). 규칙을 바꾸려면 PR에서 이유를 적습니다.
+- `rust-toolchain.toml`이 stable 채널과 `rustfmt`, `clippy` 컴포넌트를 지정하므로 rustup이 자동으로 설치합니다.
+- 포맷만 바꾸는 변경은 기능 변경과 섞지 않고 별도 커밋으로 둡니다.
+
 ## 커밋
 
 - 제목은 `<종류>: <요약>` 형식을 씁니다. 종류는 `feat`, `fix`, `docs`, `refactor`, `test`, `chore` 중 하나입니다.

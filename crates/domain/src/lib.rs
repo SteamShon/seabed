@@ -23,8 +23,7 @@ impl std::error::Error for DomainError {}
 fn validate_id(kind: &str, s: &str) -> Result<(), DomainError> {
     let ok = !s.is_empty()
         && s.len() <= 128
-        && s
-            .bytes()
+        && s.bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_');
     if ok {
         Ok(())
@@ -219,7 +218,10 @@ mod tests {
     #[test]
     fn parse_roundtrip() {
         let k = keys();
-        assert_eq!(k.parse_wal_lsn(&k.wal_key(Lsn::new(42))), Some(Lsn::new(42)));
+        assert_eq!(
+            k.parse_wal_lsn(&k.wal_key(Lsn::new(42))),
+            Some(Lsn::new(42))
+        );
         assert_eq!(
             k.parse_manifest_version(&k.manifest_key(Version::new(5))),
             Some(Version::new(5))

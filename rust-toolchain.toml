@@ -1,0 +1,4 @@
+# 포매터와 린터가 항상 설치되도록 컴포넌트를 고정한다. 채널은 stable을 따른다.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]

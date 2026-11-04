@@ -13,6 +13,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use seabed_adapter_objectstore_retry::{RetryPolicy, Retrying};
 use seabed_domain::{Lsn, NamespaceKeys};
 use seabed_ports::{ObjectStore, PutCondition, StoreError};
 
@@ -38,8 +39,39 @@ pub struct WalEntry {
     pub payload: Vec<u8>,
 }
 
+/// The store is always wrapped in `Retrying`, so transient read failures (`get`, `list`) are
+/// retried with backoff without the caller having to remember it. Writes are not retried by the
+/// wrapper: `append` resolves ambiguous put outcomes itself. Pass a `RetryPolicy` with
+/// `with_retry_policy` to change the read budget. `Retrying` does not implement `ObjectStore`, so
+/// passing an already-retrying store here does not compile.
+///
+/// A plain store works:
+///
+/// ```
+/// use std::sync::Arc;
+/// use seabed_adapter_objectstore_mem::MemObjectStore;
+/// use seabed_domain::{NamespaceId, NamespaceKeys, TenantId};
+/// use seabed_engine::wal::Wal;
+///
+/// let keys = NamespaceKeys::new(TenantId::new("t").unwrap(), NamespaceId::new("n").unwrap());
+/// let wal = Wal::new(Arc::new(MemObjectStore::new()), keys).unwrap();
+/// ```
+///
+/// The same call with a store that already retries is rejected by the compiler:
+///
+/// ```compile_fail
+/// use std::sync::Arc;
+/// use seabed_adapter_objectstore_mem::MemObjectStore;
+/// use seabed_adapter_objectstore_retry::Retrying;
+/// use seabed_domain::{NamespaceId, NamespaceKeys, TenantId};
+/// use seabed_engine::{wal::Wal, RetryPolicy};
+///
+/// let keys = NamespaceKeys::new(TenantId::new("t").unwrap(), NamespaceId::new("n").unwrap());
+/// let store = Retrying::new(MemObjectStore::new(), RetryPolicy::default());
+/// let wal = Wal::new(Arc::new(store), keys).unwrap();
+/// ```
 pub struct Wal<S: ObjectStore> {
-    store: Arc<S>,
+    store: Retrying<Arc<S>>,
     keys: NamespaceKeys,
     /// Hint for the next free LSN. 0 means unknown.
     next: AtomicU64,
@@ -54,7 +86,7 @@ impl<S: ObjectStore> Wal<S> {
             ));
         }
         Ok(Self {
-            store,
+            store: Retrying::new(store, RetryPolicy::default()),
             keys,
             next: AtomicU64::new(0),
             max_attempts: 10_000,
@@ -63,6 +95,12 @@ impl<S: ObjectStore> Wal<S> {
 
     pub fn with_max_attempts(mut self, n: usize) -> Self {
         self.max_attempts = n;
+        self
+    }
+
+    /// Replaces the read retry policy. `RetryPolicy::immediate(1)` disables read retries.
+    pub fn with_retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.store = Retrying::new(self.store.inner().clone(), policy);
         self
     }
 

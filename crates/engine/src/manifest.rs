@@ -9,6 +9,7 @@
 
 use std::sync::Arc;
 
+use seabed_adapter_objectstore_retry::{RetryPolicy, Retrying};
 use seabed_domain::{NamespaceKeys, Version};
 use seabed_ports::{ObjectStore, PutCondition, StoreError};
 
@@ -35,8 +36,13 @@ pub struct Manifest {
     pub payload: Vec<u8>,
 }
 
+/// The store is always wrapped in `Retrying`, so transient read failures (`get`, `list`) are
+/// retried with backoff without the caller having to remember it. Writes are not retried by the
+/// wrapper: `commit` resolves ambiguous put outcomes itself. Pass a `RetryPolicy` with
+/// `with_retry_policy` to change the read budget. `Retrying` does not implement `ObjectStore`, so
+/// passing an already-retrying store here does not compile.
 pub struct ManifestStore<S: ObjectStore> {
-    store: Arc<S>,
+    store: Retrying<Arc<S>>,
     keys: NamespaceKeys,
     max_attempts: usize,
 }
@@ -49,10 +55,16 @@ impl<S: ObjectStore> ManifestStore<S> {
             ));
         }
         Ok(Self {
-            store,
+            store: Retrying::new(store, RetryPolicy::default()),
             keys,
             max_attempts: 1_000,
         })
+    }
+
+    /// Replaces the read retry policy. `RetryPolicy::immediate(1)` disables read retries.
+    pub fn with_retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.store = Retrying::new(self.store.inner().clone(), policy);
+        self
     }
 
     fn parse(version: Version, bytes: &[u8]) -> Result<Manifest, ManifestError> {

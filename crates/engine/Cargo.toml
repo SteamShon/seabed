@@ -7,6 +7,7 @@ publish = false
 [dependencies]
 seabed-domain = { path = "../domain" }
 seabed-ports = { path = "../ports" }
+seabed-adapter-objectstore-retry = { path = "../adapter-objectstore-retry" }
 
 [dev-dependencies]
 seabed-adapter-objectstore-mem = { path = "../adapter-objectstore-mem" }
