@@ -156,3 +156,7 @@ cargo test --workspace
 ## 라이선스
 
 아직 정하지 않았습니다. 공개할 때 결정합니다. 그 전까지는 의존성의 라이선스를 기록해 선택지를 막지 않습니다.
+
+## 기여 방식
+
+브랜치, PR, 머지 규칙은 [CONTRIBUTING.md](CONTRIBUTING.md)에 있습니다. coding agent는 [AGENTS.md](AGENTS.md)를 따릅니다.
