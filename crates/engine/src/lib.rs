@@ -1,6 +1,7 @@
 //! Application services that depend on ports only.
 
 pub mod manifest;
+pub mod segment;
 pub mod wal;
 
 /// Read retry policy used by `Wal` and `ManifestStore` (re-exported so callers need no extra crate).
