@@ -9,13 +9,39 @@ use seabed_adapter_objectstore_mem::{
 };
 use seabed_domain::{NamespaceId, NamespaceKeys, TenantId};
 use seabed_engine::manifest_content::Sha256Hex;
+use seabed_engine::manifest_content::{AttrKind, AttrSchema};
 use seabed_engine::sot::{
-    decode, encode, valid_attr_name, AttrValue, DocRow, SotError, SotRef, SotStore, DOCS_FILE,
+    self as sot, schema_of, valid_attr_name, AttrValue, DocRow, SotError, SotRef, SotStore,
+    DOCS_FILE,
 };
 use seabed_engine::RetryPolicy;
 use seabed_ports::{ObjectStore, PutCondition};
 
 const DIMS: u32 = 3;
+
+/// Namespace schema covering every attribute these tests use.
+fn test_schema() -> AttrSchema {
+    [
+        ("active", AttrKind::Bool),
+        ("color", AttrKind::Str),
+        ("n", AttrKind::I64),
+        ("price", AttrKind::I64),
+        ("score", AttrKind::F64),
+    ]
+    .into_iter()
+    .map(|(n, k)| (n.to_string(), k))
+    .collect()
+}
+
+/// Encodes with exactly the schema the rows use (inference only for tests that don't care).
+fn encode(rows: &[DocRow], dims: u32) -> Result<Vec<u8>, SotError> {
+    sot::encode(rows, &schema_of(rows)?, dims)
+}
+
+/// Decodes against the full test schema.
+fn decode(bytes: &[u8], dims: u32) -> Result<Vec<DocRow>, SotError> {
+    sot::decode(bytes, &test_schema(), dims)
+}
 
 fn keys() -> NamespaceKeys {
     NamespaceKeys::new(
@@ -183,9 +209,13 @@ fn store_write_then_read_checks_size_and_hash() {
     let mem = Arc::new(MemObjectStore::new());
     let store = SotStore::new(mem.clone());
     let k = keys();
-    let r = store.write(&k, "seg-0001", &sample(), DIMS).unwrap();
+    let r = store
+        .write(&k, "seg-0001", &sample(), &test_schema(), DIMS)
+        .unwrap();
     assert_eq!(
-        store.read(&k, "seg-0001", &r, DIMS).unwrap(),
+        store
+            .read(&k, "seg-0001", &r, &test_schema(), DIMS)
+            .unwrap(),
         sorted(sample())
     );
 
@@ -194,7 +224,9 @@ fn store_write_then_read_checks_size_and_hash() {
 
     // Never overwritten.
     assert_eq!(
-        store.write(&k, "seg-0001", &sample(), DIMS).unwrap_err(),
+        store
+            .write(&k, "seg-0001", &sample(), &test_schema(), DIMS)
+            .unwrap_err(),
         SotError::AlreadyExists
     );
 
@@ -204,7 +236,9 @@ fn store_write_then_read_checks_size_and_hash() {
         sha256: Sha256Hex([0; 32]),
     };
     assert_eq!(
-        store.read(&k, "seg-0001", &wrong_hash, DIMS).unwrap_err(),
+        store
+            .read(&k, "seg-0001", &wrong_hash, &test_schema(), DIMS)
+            .unwrap_err(),
         SotError::RefMismatch
     );
     let wrong_size = SotRef {
@@ -212,7 +246,9 @@ fn store_write_then_read_checks_size_and_hash() {
         ..r.clone()
     };
     assert_eq!(
-        store.read(&k, "seg-0001", &wrong_size, DIMS).unwrap_err(),
+        store
+            .read(&k, "seg-0001", &wrong_size, &test_schema(), DIMS)
+            .unwrap_err(),
         SotError::RefMismatch
     );
 
@@ -224,7 +260,9 @@ fn store_write_then_read_checks_size_and_hash() {
     )
     .unwrap();
     assert_eq!(
-        store.read(&k, "seg-0001", &r, DIMS).unwrap_err(),
+        store
+            .read(&k, "seg-0001", &r, &test_schema(), DIMS)
+            .unwrap_err(),
         SotError::RefMismatch
     );
 }
@@ -234,7 +272,9 @@ fn store_rejects_invalid_segment_ids_without_writing() {
     let mem = Arc::new(MemObjectStore::new());
     let store = SotStore::new(mem.clone());
     assert_eq!(
-        store.write(&keys(), "../x", &sample(), DIMS).unwrap_err(),
+        store
+            .write(&keys(), "../x", &sample(), &test_schema(), DIMS)
+            .unwrap_err(),
         SotError::InvalidSegmentId("../x".into())
     );
     assert!(mem.list("").unwrap().is_empty());
@@ -244,9 +284,13 @@ fn store_rejects_invalid_segment_ids_without_writing() {
 fn reading_costs_one_get() {
     let mem = Arc::new(CountingObjectStore::new(MemObjectStore::new()));
     let store = SotStore::new(mem.clone());
-    let r = store.write(&keys(), "seg-0001", &sample(), DIMS).unwrap();
+    let r = store
+        .write(&keys(), "seg-0001", &sample(), &test_schema(), DIMS)
+        .unwrap();
     let before = mem.stats();
-    store.read(&keys(), "seg-0001", &r, DIMS).unwrap();
+    store
+        .read(&keys(), "seg-0001", &r, &test_schema(), DIMS)
+        .unwrap();
     let after = mem.stats();
     assert_eq!(after.gets - before.gets, 1);
     assert_eq!(after.lists, before.lists);
@@ -310,10 +354,11 @@ fn arb_rows() -> impl Strategy<Value = Vec<DocRow>> {
 proptest! {
     #[test]
     fn rows_roundtrip_and_reencode_identically(rows in arb_rows()) {
-        let bytes = encode(&rows, DIMS).unwrap();
-        let back = decode(&bytes, DIMS).unwrap();
+        let schema = schema_of(&rows).unwrap();
+        let bytes = sot::encode(&rows, &schema, DIMS).unwrap();
+        let back = sot::decode(&bytes, &schema, DIMS).unwrap();
         prop_assert_eq!(&back, &sorted(rows));
-        prop_assert_eq!(encode(&back, DIMS).unwrap(), bytes);
+        prop_assert_eq!(sot::encode(&back, &schema, DIMS).unwrap(), bytes);
     }
 }
 
@@ -364,6 +409,7 @@ struct Foreign {
     vectors: Vec<VecCell>,
     extra: Vec<(Field, ArrayRef)>,
     metadata: Option<Vec<(&'static str, &'static str)>>,
+    row_group_size: Option<usize>,
 }
 
 impl Foreign {
@@ -374,11 +420,17 @@ impl Foreign {
             deleted: vec![Some(false)],
             vectors: vec![Some(vec![Some(vector.iter().map(|f| Some(*f)).collect())])],
             extra: vec![],
+            row_group_size: None,
             metadata: Some(vec![
                 ("seabed.sot.format_version", "1"),
                 ("seabed.sot.dims", "3"),
             ]),
         }
+    }
+
+    fn with_row_group_size(mut self, n: usize) -> Self {
+        self.row_group_size = Some(n);
+        self
     }
 
     fn bytes(self) -> Vec<u8> {
@@ -401,16 +453,19 @@ impl Foreign {
         }
         let schema = Arc::new(Schema::new(fields));
         let batch = RecordBatch::try_new(schema.clone(), cols).unwrap();
-        let props = self.metadata.map(|kv| {
-            parquet::file::properties::WriterProperties::builder()
-                .set_key_value_metadata(Some(
-                    kv.into_iter()
-                        .map(|(k, v)| KeyValue::new(k.to_string(), v.to_string()))
-                        .collect(),
-                ))
-                .build()
-        });
-        let mut w = parquet::arrow::ArrowWriter::try_new(Vec::new(), schema, props).unwrap();
+        let mut props = parquet::file::properties::WriterProperties::builder();
+        if let Some(kv) = self.metadata {
+            props = props.set_key_value_metadata(Some(
+                kv.into_iter()
+                    .map(|(k, v)| KeyValue::new(k.to_string(), v.to_string()))
+                    .collect(),
+            ));
+        }
+        if let Some(n) = self.row_group_size {
+            props = props.set_max_row_group_row_count(Some(n));
+        }
+        let mut w =
+            parquet::arrow::ArrowWriter::try_new(Vec::new(), schema, Some(props.build())).unwrap();
         w.write(&batch).unwrap();
         w.into_inner().unwrap()
     }
@@ -596,7 +651,7 @@ fn many_rows_spanning_several_record_batches_roundtrip() {
 fn read_retries_transient_get_failures() {
     let mem = Arc::new(MemObjectStore::new());
     let r = SotStore::new(mem.clone())
-        .write(&keys(), "seg-0001", &sample(), DIMS)
+        .write(&keys(), "seg-0001", &sample(), &test_schema(), DIMS)
         .unwrap();
     let cfg = FaultConfig {
         get_unavailable_ppm: 500_000,
@@ -607,10 +662,114 @@ fn read_retries_transient_get_failures() {
     };
     // Without retries, half the reads fail.
     let no_retry = flaky(RetryPolicy::immediate(1));
-    assert!((0..20).any(|_| no_retry.read(&keys(), "seg-0001", &r, DIMS).is_err()));
+    assert!((0..20).any(|_| no_retry
+        .read(&keys(), "seg-0001", &r, &test_schema(), DIMS)
+        .is_err()));
     // With retries, all succeed.
     let retrying = flaky(RetryPolicy::immediate(64));
     for _ in 0..20 {
-        retrying.read(&keys(), "seg-0001", &r, DIMS).unwrap();
+        retrying
+            .read(&keys(), "seg-0001", &r, &test_schema(), DIMS)
+            .unwrap();
     }
+}
+
+// ---- Namespace attribute schema (manifest-driven) ----
+
+fn kinds(pairs: &[(&str, AttrKind)]) -> AttrSchema {
+    pairs.iter().map(|(n, k)| (n.to_string(), *k)).collect()
+}
+
+#[test]
+fn encode_writes_every_schema_column_even_if_no_row_uses_it() {
+    let schema = kinds(&[("color", AttrKind::Str), ("price", AttrKind::I64)]);
+    let rows =
+        vec![DocRow::upsert("a", 1, vec![]).with_attr("color", AttrValue::Str("red".into()))];
+    let bytes = sot::encode(&rows, &schema, DIMS).unwrap();
+    let reader = SerializedFileReader::new(Bytes::from(bytes.clone())).unwrap();
+    let names: Vec<_> = reader
+        .metadata()
+        .file_metadata()
+        .schema_descr()
+        .root_schema()
+        .get_fields()
+        .iter()
+        .map(|f| f.name().to_string())
+        .collect();
+    assert_eq!(names, ["id", "lsn", "deleted", "vectors", "color", "price"]);
+    assert_eq!(sot::decode(&bytes, &schema, DIMS).unwrap(), rows);
+}
+
+#[test]
+fn encode_rejects_attributes_outside_or_against_the_schema() {
+    let schema = kinds(&[("price", AttrKind::I64)]);
+    let unknown = [DocRow::upsert("a", 1, vec![]).with_attr("color", AttrValue::Str("x".into()))];
+    assert_eq!(
+        sot::encode(&unknown, &schema, DIMS).unwrap_err(),
+        SotError::UnknownAttr("color".into())
+    );
+    let wrong = [DocRow::upsert("a", 1, vec![]).with_attr("price", AttrValue::F64(1.5))];
+    assert_eq!(
+        sot::encode(&wrong, &schema, DIMS).unwrap_err(),
+        SotError::AttrTypeConflict {
+            name: "price".into()
+        }
+    );
+}
+
+#[test]
+fn a_file_from_an_older_smaller_schema_reads_with_the_current_one() {
+    let old = kinds(&[("price", AttrKind::I64)]);
+    let rows = vec![DocRow::upsert("a", 1, vec![]).with_attr("price", AttrValue::I64(3))];
+    let bytes = sot::encode(&rows, &old, DIMS).unwrap();
+    // The schema grew after the file was written; the new column simply reads as absent.
+    let grown = kinds(&[("color", AttrKind::Str), ("price", AttrKind::I64)]);
+    assert_eq!(sot::decode(&bytes, &grown, DIMS).unwrap(), rows);
+}
+
+#[test]
+fn decode_refuses_columns_the_schema_lacks_or_types_differently() {
+    let rows = vec![DocRow::upsert("a", 1, vec![]).with_attr("price", AttrValue::I64(3))];
+    let bytes = sot::encode(&rows, &kinds(&[("price", AttrKind::I64)]), DIMS).unwrap();
+    assert_eq!(
+        sot::decode(&bytes, &AttrSchema::new(), DIMS).unwrap_err(),
+        SotError::SchemaMismatch {
+            name: "price".into()
+        }
+    );
+    assert_eq!(
+        sot::decode(&bytes, &kinds(&[("price", AttrKind::F64)]), DIMS).unwrap_err(),
+        SotError::SchemaMismatch {
+            name: "price".into()
+        }
+    );
+}
+
+/// Deferred from PR #11 review: validation must hold across row groups, not only the first.
+#[test]
+fn decode_validates_across_row_groups() {
+    fn two_row_groups(f: Foreign) -> Vec<u8> {
+        let bytes = f.with_row_group_size(1).bytes();
+        let reader = SerializedFileReader::new(Bytes::from(bytes.clone())).unwrap();
+        assert_eq!(reader.metadata().num_row_groups(), 2);
+        bytes
+    }
+    let base = || {
+        let mut f = Foreign::one([1.0, 2.0, 3.0]);
+        f.ids = vec![Some("a"), Some("b")];
+        f.lsns = vec![Some(1), Some(2)];
+        f.deleted = vec![Some(true), Some(true)];
+        f.vectors = vec![Some(vec![]), Some(vec![])];
+        f
+    };
+    // Sanity: valid across two row groups.
+    assert_eq!(decode(&two_row_groups(base()), DIMS).unwrap().len(), 2);
+    // Null lsn only in the second row group.
+    let mut null_late = base();
+    null_late.lsns = vec![Some(1), None];
+    assert!(is_format(decode(&two_row_groups(null_late), DIMS)));
+    // Order broken only across the boundary.
+    let mut unsorted = base();
+    unsorted.ids = vec![Some("b"), Some("a")];
+    assert!(is_format(decode(&two_row_groups(unsorted), DIMS)));
 }

@@ -9,13 +9,16 @@
 //! newer manifest, drop the fields it does not know, and commit the result. **Adding a field
 //! therefore requires bumping `CONTENT_FORMAT_VERSION`.**
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 
 use seabed_domain::{Lsn, NamespaceKeys};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-pub const CONTENT_FORMAT_VERSION: u32 = 1;
+use crate::sot::{valid_attr_name, SotRef};
+
+/// 2: segments reference their Parquet SoT (`docs`) with an optional index; `attr_schema` added.
+pub const CONTENT_FORMAT_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContentError {
@@ -27,6 +30,14 @@ pub enum ContentError {
     WrongNamespace {
         manifest: String,
         expected: String,
+    },
+    /// An attribute name in the schema is not a valid column name.
+    InvalidAttrName(String),
+    /// A new version would change or drop an attribute's type. The schema only grows.
+    AttrSchemaChanged {
+        name: String,
+        before: AttrKind,
+        after: Option<AttrKind>,
     },
     /// A new version would move `indexed_through` backwards (or drop it). LSNs only grow.
     IndexedThroughRegressed {
@@ -51,6 +62,15 @@ impl fmt::Display for ContentError {
             ContentError::WrongNamespace { manifest, expected } => {
                 write!(f, "manifest belongs to {manifest}, expected {expected}")
             }
+            ContentError::InvalidAttrName(n) => write!(f, "invalid attribute name {n:?}"),
+            ContentError::AttrSchemaChanged {
+                name,
+                before,
+                after,
+            } => write!(
+                f,
+                "attribute {name:?} would change from {before:?} to {after:?}; the schema only grows"
+            ),
             ContentError::IndexedThroughRegressed { previous, next } => write!(
                 f,
                 "indexed_through would go from {previous} back to {next:?}"
@@ -76,6 +96,20 @@ pub enum Distance {
     L2,
     InnerProduct,
 }
+
+/// Type of one attribute column, fixed namespace-wide once added.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttrKind {
+    Str,
+    I64,
+    F64,
+    Bool,
+}
+
+/// Namespace-wide attribute schema: name to type. Kept in the manifest so every SoT file is
+/// written with the same column types; it only grows (PLAN 6.7).
+pub type AttrSchema = BTreeMap<String, AttrKind>;
 
 /// What the indexes were built with. Querying or writing with anything else must fail at once,
 /// because the result would be silently wrong (wrong embedding space, wrong tokens).
@@ -187,14 +221,27 @@ impl<'de> Deserialize<'de> for Sha256Hex {
 }
 
 /// One immutable segment that belongs to this manifest version.
+///
+/// The Parquet SoT (`docs`) is the segment's source of truth and is always present. Indexes are
+/// derived from it (PLAN 5.1) and may be missing, e.g. before M2 builds vector indexes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SegmentRef {
     /// Directory name under the namespace's `segments/`. ASCII letters, digits, `-` and `_`.
     pub id: String,
+    /// `segments/<id>/docs.parquet`: size and SHA-256 of the bytes actually written.
+    pub docs: SotRef,
+    /// `segments/<id>/data.sbsg`, if an index container was built.
+    pub index: Option<IndexRef>,
+}
+
+/// What the manifest records about a segment's `.sbsg` index container.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IndexRef {
     /// Object size in bytes, needed to read the footer without an extra request.
     pub size: u64,
-    /// SHA-256 of the segment's TOC. Opening checks it, so a different object at the same key
+    /// SHA-256 of the container's TOC. Opening checks it, so a different object at the same key
     /// is detected.
     pub toc_sha256: Sha256Hex,
 }
@@ -219,6 +266,8 @@ pub struct ManifestContent {
     /// unindexed tail that strong reads must also search. `None`: nothing indexed yet.
     pub indexed_through: Option<u64>,
     pub index_binding: Option<IndexBinding>,
+    /// Attribute columns every SoT file is written with. Only grows.
+    pub attr_schema: AttrSchema,
     /// In the order they were added.
     pub segments: Vec<SegmentRef>,
 }
@@ -232,6 +281,7 @@ impl ManifestContent {
             namespace: keys.namespace().to_string(),
             indexed_through: None,
             index_binding: None,
+            attr_schema: AttrSchema::new(),
             segments: Vec::new(),
         }
     }
@@ -249,6 +299,28 @@ impl ManifestContent {
             return Err(ContentError::DuplicateSegment(segment.id));
         }
         self.segments.push(segment);
+        Ok(())
+    }
+
+    /// Adds attributes to the schema. An attribute already present must keep its type.
+    /// Fails without changing anything if any addition conflicts or has an invalid name.
+    pub fn extend_attr_schema(&mut self, additions: &AttrSchema) -> Result<(), ContentError> {
+        for (name, kind) in additions {
+            if !valid_attr_name(name) {
+                return Err(ContentError::InvalidAttrName(name.clone()));
+            }
+            if let Some(before) = self.attr_schema.get(name) {
+                if before != kind {
+                    return Err(ContentError::AttrSchemaChanged {
+                        name: name.clone(),
+                        before: *before,
+                        after: Some(*kind),
+                    });
+                }
+            }
+        }
+        self.attr_schema
+            .extend(additions.iter().map(|(n, k)| (n.clone(), *k)));
         Ok(())
     }
 
@@ -270,7 +342,10 @@ impl ManifestContent {
 
     /// Checks that `next` may follow `self` as the next manifest version:
     /// - once a binding is stored, every later version keeps exactly that binding;
-    /// - `indexed_through` never moves backwards and is never dropped once set.
+    /// - `indexed_through` never moves backwards and is never dropped once set;
+    /// - every attribute in the schema keeps its type (the schema only grows).
+    ///
+    /// The segment list is not constrained here: compaction will replace segments.
     ///
     /// Pure, so the rules are testable without a store; `ManifestStore::commit_content`
     /// applies it against the expected version.
@@ -285,6 +360,16 @@ impl ManifestContent {
                         requested: "None".into(),
                     })
                 }
+            }
+        }
+        for (name, before) in &self.attr_schema {
+            let after = next.attr_schema.get(name).copied();
+            if after != Some(*before) {
+                return Err(ContentError::AttrSchemaChanged {
+                    name: name.clone(),
+                    before: *before,
+                    after,
+                });
             }
         }
         if let Some(prev) = self.indexed_through {
@@ -315,6 +400,9 @@ impl ManifestContent {
                 manifest: format!("{}/{}", c.tenant, c.namespace),
                 expected: format!("{tenant}/{namespace}"),
             });
+        }
+        if let Some(bad) = c.attr_schema.keys().find(|n| !valid_attr_name(n)) {
+            return Err(ContentError::InvalidAttrName(bad.clone()));
         }
         let mut seen = HashSet::new();
         for s in &c.segments {

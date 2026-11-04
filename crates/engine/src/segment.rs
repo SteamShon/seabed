@@ -26,7 +26,7 @@ use seabed_domain::{Key, NamespaceKeys};
 use seabed_ports::{ObjectStore, PutCondition, StoreError};
 use sha2::{Digest, Sha256};
 
-use crate::manifest_content::{valid_segment_id, SegmentRef, Sha256Hex};
+use crate::manifest_content::{valid_segment_id, IndexRef, Sha256Hex};
 
 pub const FORMAT_VERSION: u16 = 1;
 pub const MAGIC: [u8; 4] = *b"SBSG";
@@ -231,35 +231,38 @@ impl<S: ObjectStore> SegmentStore<S> {
         }
     }
 
-    /// Writes segment `id` of the namespace and returns the reference to add to the manifest.
+    /// Writes segment `id`'s index container and returns the reference to put in the
+    /// manifest's `SegmentRef::index`.
     pub fn write_segment(
         &self,
         keys: &NamespaceKeys,
         id: &str,
         segment: &SegmentBuilder,
-    ) -> Result<SegmentRef, SegmentError> {
+    ) -> Result<IndexRef, SegmentError> {
         if !valid_segment_id(id) {
             return Err(SegmentError::InvalidSegmentId(id.to_string()));
         }
         let w = self.write(&keys.segment_key(id, DATA_FILE), segment)?;
-        Ok(SegmentRef {
-            id: id.to_string(),
+        Ok(IndexRef {
             size: w.size,
             toc_sha256: Sha256Hex(w.toc_sha256),
         })
     }
 
-    /// Opens a segment listed in the manifest and checks that the object is the one recorded.
+    /// Opens segment `id`'s index container as recorded in the manifest and checks that the
+    /// object is the one recorded.
     pub fn open_ref(
         &self,
         keys: &NamespaceKeys,
-        segment: &SegmentRef,
+        id: &str,
+        index: &IndexRef,
     ) -> Result<SegmentReader<'_, S>, SegmentError> {
-        let reader = self.open(&keys.segment_key(&segment.id, DATA_FILE), segment.size)?;
-        if reader.toc_sha256 != segment.toc_sha256.0 {
-            return Err(SegmentError::RefMismatch {
-                id: segment.id.clone(),
-            });
+        if !valid_segment_id(id) {
+            return Err(SegmentError::InvalidSegmentId(id.to_string()));
+        }
+        let reader = self.open(&keys.segment_key(id, DATA_FILE), index.size)?;
+        if reader.toc_sha256 != index.toc_sha256.0 {
+            return Err(SegmentError::RefMismatch { id: id.to_string() });
         }
         Ok(reader)
     }
