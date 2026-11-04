@@ -86,9 +86,13 @@ fn seeded(fail_first: usize, err: StoreError) -> Scripted {
 fn healthy_store_passes_reads_and_writes_through() {
     let store = Retrying::new(MemObjectStore::new(), RetryPolicy::immediate(3));
     let k = Key::new("a/1");
-    store.put(&k, b"abc".to_vec(), PutCondition::IfNoneMatch).unwrap();
+    store
+        .put(&k, b"abc".to_vec(), PutCondition::IfNoneMatch)
+        .unwrap();
     assert_eq!(
-        store.put(&k, b"x".to_vec(), PutCondition::IfNoneMatch).unwrap_err(),
+        store
+            .put(&k, b"x".to_vec(), PutCondition::IfNoneMatch)
+            .unwrap_err(),
         StoreError::PreconditionFailed
     );
     assert_eq!(store.get(&k).unwrap().0, b"abc");

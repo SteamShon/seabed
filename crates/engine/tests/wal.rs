@@ -2,10 +2,12 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::thread;
 
-use seabed_adapter_objectstore_mem::{CountingObjectStore, FaultConfig, FaultInjecting, MemObjectStore};
-use seabed_engine::RetryPolicy;
+use seabed_adapter_objectstore_mem::{
+    CountingObjectStore, FaultConfig, FaultInjecting, MemObjectStore,
+};
 use seabed_domain::{Lsn, NamespaceId, NamespaceKeys, TenantId};
 use seabed_engine::wal::Wal;
+use seabed_engine::RetryPolicy;
 
 fn keys() -> NamespaceKeys {
     NamespaceKeys::new(
@@ -78,7 +80,9 @@ fn lost_responses_do_not_duplicate_or_lose_entries() {
         list_unavailable_ppm: 100_000,
     };
     let faulty = Arc::new(FaultInjecting::new(mem.clone(), cfg));
-    let wal = Wal::new(faulty, keys()).unwrap().with_retry_policy(RetryPolicy::immediate(32));
+    let wal = Wal::new(faulty, keys())
+        .unwrap()
+        .with_retry_policy(RetryPolicy::immediate(32));
 
     thread::scope(|sc| {
         for t in 0..4u64 {
@@ -97,7 +101,11 @@ fn lost_responses_do_not_duplicate_or_lose_entries() {
     let entries = clean.read_from(Lsn::new(1)).unwrap();
     let mut seen = HashSet::new();
     for e in &entries {
-        assert!(seen.insert(e.request_id), "duplicate request_id {}", e.request_id);
+        assert!(
+            seen.insert(e.request_id),
+            "duplicate request_id {}",
+            e.request_id
+        );
     }
     assert_eq!(seen.len(), 100, "no append may be lost");
     assert_eq!(entries.len(), 100);

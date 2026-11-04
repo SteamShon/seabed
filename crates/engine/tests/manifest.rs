@@ -3,9 +3,9 @@ use std::sync::Arc;
 use std::thread;
 
 use seabed_adapter_objectstore_mem::{FaultConfig, FaultInjecting, MemObjectStore};
-use seabed_engine::RetryPolicy;
 use seabed_domain::{NamespaceId, NamespaceKeys, TenantId, Version};
 use seabed_engine::manifest::{ManifestError, ManifestStore};
+use seabed_engine::RetryPolicy;
 
 fn keys() -> NamespaceKeys {
     NamespaceKeys::new(
@@ -23,13 +23,19 @@ fn first_commit_then_stale_commit_conflicts() {
     assert_eq!(v1, Version::new(1));
 
     // Creating "the first manifest" again must fail.
-    assert_eq!(ms.commit(None, 2, b"again").unwrap_err(), ManifestError::CommitConflict);
+    assert_eq!(
+        ms.commit(None, 2, b"again").unwrap_err(),
+        ManifestError::CommitConflict
+    );
 
     let v2 = ms.commit(Some(v1), 3, b"second").unwrap();
     assert_eq!(v2, Version::new(2));
 
     // A writer that still believes v1 is the latest must lose.
-    assert_eq!(ms.commit(Some(v1), 4, b"stale").unwrap_err(), ManifestError::CommitConflict);
+    assert_eq!(
+        ms.commit(Some(v1), 4, b"stale").unwrap_err(),
+        ManifestError::CommitConflict
+    );
 
     let latest = ms.load_latest().unwrap().unwrap();
     assert_eq!(latest.version, v2);
@@ -59,7 +65,10 @@ fn run_contended_commits(ms: &ManifestStore<impl seabed_ports::ObjectStore>) {
     });
 
     let total = THREADS * PER_THREAD;
-    assert_eq!(ms.load_latest().unwrap().unwrap().version, Version::new(total));
+    assert_eq!(
+        ms.load_latest().unwrap().unwrap().version,
+        Version::new(total)
+    );
 
     // History is linear: versions 1..=total all exist and each commit appears exactly once.
     let mut ids = HashSet::new();
