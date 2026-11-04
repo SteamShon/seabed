@@ -1,0 +1,180 @@
+# seabed 프로젝트 계획
+
+v0.4 · 2026-10-30 · 대화에서 합의한 내용 기준.
+표기: **[결정]** 사용자가 정함, **[제안]** 문서에 적었으나 미확정, **[가설]** 측정으로 확인해야 함, **[확인 필요]** 조사하지 못함.
+같은 내용의 Claude Docs 원본은 [LINKS.md](LINKS.md)에 있습니다. 결정만 모은 목록은 [DECISIONS.md](DECISIONS.md)입니다.
+
+## 1. 배경과 문제
+
+운영 경험에서 온 문제(자세한 표는 README의 Why):
+
+- ES HNSW: 문서가 늘면 메모리 한계, 업데이트 비효율. Vespa: 나으나 큰 메모리 노드가 비쌈.
+- 주기적 대량 재색인: 서비스 노드가 인덱싱까지 맡아서, ES 6노드에 200TB 전체 색인이 일주일(시간당 약 1.2TB). 병렬도를 올려도 노드를 늘려야만 빨라짐.
+- ES 운영: master 노드 한 대 이탈로 클러스터 불안정, force merge OOM으로 노드가 죽고 복귀 못함.
+- turbopuffer: 싸고 acceptable하지만 큰 namespace 비용 증가, 비오픈소스.
+
+**목표:** object storage를 source of truth로 두고 캐시 계층을 얹는 구조의 오픈소스 대안을 억 단위 이상 규모에서 만든다. 1차 적용 후보는 새로 가는 ads DMP 조직의 feature store다.
+
+## 2. 차별점 가설과 시장 위치
+
+**[결정, 사용자 판단]** 차별점은 simple but efficient(비용과 성능 모두)한 분산 시스템이다. 기존 시스템은 기존 primitive 위에 올려서 기존 기능을 그대로 쓸 수 있다는 장점이 있지만, 구성이 복잡하고 문제가 생기면 운영이 어렵다.
+
+시장 조사(2026-10, 웹 문서 기준, 성능 수치는 대부분 벤더 자체 주장이며 재현하지 않음)에서 확인한 것:
+
+- 기본 기술은 수렴 중: HNSW → IVF 클러스터 + 강한 양자화(ES DiskBBQ, VectorChord, Milvus와 Lance의 RaBitQ, Chroma와 turbopuffer의 SPANN/SPFresh), 쓰기 경로는 오브젝트 스토리지 WAL(Milvus Woodpecker, Chroma wal3, turbopuffer). **이것만으로는 차별점이 아니다.**
+- 오픈소스 분산은 구성이 무거움: Milvus(Kubernetes, etcd, 오브젝트 스토리지, WAL 계층, 여러 노드 역할), Chroma 분산(Kubernetes/Helm, Postgres), LanceDB 대규모 분산은 Enterprise, VectorChord는 단일 노드 Postgres, Loams는 TiKV 사용.
+- 1억 건 이하는 VectorChord, Qdrant 같은 단순하고 싼 대안이 있음(벤더 주장).
+
+**[가설, 미검증]** (a) 구성이 단순한 오픈소스 분산이 비어 있다, (b) 서비스 노드와 분리된 대량 재색인과 비용·시간 견적이 실질적 차이를 만든다, (c) 모든 selectivity 구간에서 예측 가능한 필터 recall을 낼 수 있다. 다른 시스템에 없다고 **확인한 것이 아니다.**
+
+**우리의 약점:** 성숙도와 생태계, 풀텍스트·집계·보안의 풍부함(ES, OpenSearch), 혼자 개발하는 규모.
+
+**대상 구간:** 억 단위 이상 코퍼스, 필터 포함 검색, 주기적 대량 갱신이 잦고, 서비스 노드 증설 없이 비용을 통제하려는 팀. 에이전트별 소규모 namespace(Weaviate, turbopuffer 등이 이미 맞춤)나 1천만 이하는 목표가 아니다.
+
+**[미정]** "이거면 쓴다"는 최소 조건(전체 갱신 시간, 비용, 필터 recall 하한의 숫자). M0 결과로 판정한다. M0에서 기준선이 이미 만족하면 새로 만들지 않고 기여나 재사용으로 전환한다.
+
+## 3. 목표와 비목표
+
+목표:
+
+1. 억 단위 이상 벡터를 낮은 비용으로 저장·검색 (p99 1초 이하, 비용은 turbopuffer와 comparable) [결정]
+2. 운영 단순, scale-out 가능 (상태 없는 쿼리 노드 + object storage 중심) [결정]
+3. 필터 first class: 모든 검색에 필터, selectivity 10% 남는 경우부터 0.01% 이하, 조건은 equality/IN/range/조합 전부 [결정]
+4. 실시간 업데이트, 벡터 변경과 메타데이터 변경 분리 [결정]
+5. 벡터 + BM25 하이브리드, 한국어 필수 [결정]
+6. 문서당 multi-vector와 group-by [결정: item당 수 개~수십 개, 변동 가능]
+7. OLTP 우선, S3의 원본 파일에 대한 OLAP 가능, OLTP에 영향 없는 bulk import/export [결정]
+8. 오픈소스 컴포넌트를 적극 활용하고 결과물도 오픈소스 [결정]
+
+비목표(초기): 수십 ms 초저지연, 온프렘 지원(AWS로 시작, 나중에), 범용 SQL 엔진(OLAP는 외부 엔진에 위임), 운영 기능(무중단 업그레이드, 오토스케일, 백업과 복구는 SaaS 단계).
+
+## 4. 요구사항
+
+| 항목 | 내용 |
+| --- | --- |
+| 대표 쿼리 | user embedding은 offline. 유저 history의 각 item에 대해 ANN(요청당 N개 fan-out). 배치 쿼리 API 필요 |
+| 규모 | 억 단위 이상 item, 벡터는 수십억. 예: 1억 item × 20벡터 = 20억 벡터, 768차원 fp32로 원본 약 6TB(가정) → 양자화 필수 |
+| 지연 | p99 1초 이하 (cold 쿼리 허용) |
+| recall | 필터 쿼리 포함 recall@10 90~95%(turbopuffer와 같은 기준). 난이도 구간별로 측정하고 가장 약한 구간 기준 |
+| 비용 | turbopuffer와 comparable. 공개 가격과 계산기로 추정(직접 측정 안 함). "comparable"의 허용 범위는 기준선 계산 후 결정(제안: ±30%) |
+| 일관성 | strong 기본(쓴 직후 보임), 쿼리별 eventual 선택. eventual의 반영 지연은 몇 초~최대 1분(불확실). workload별 freshness 설정 |
+| 업데이트 | 실시간. 변경 비율이 다양하므로 엔진이 측정해서 증분 / 부분 재빌드 / 전체 재빌드를 자동 선택(기본 목표 비용 최소화), 예상 시간과 비용을 알려 주고 사용자가 조정 |
+| API | turbopuffer와 공통 기능 호환, 고유 기능은 확장 필드 |
+| 인프라 | AWS로 시작, 다른 클라우드도 선택적, 온프렘은 나중 |
+| 관측성 | OpenTelemetry 스펙 |
+
+## 5. 설계 원칙
+
+1. **SoT와 인덱스 분리 [제안]:** 원본은 object storage의 불변 segment + manifest, 모든 인덱스는 파생. turbopuffer v3가 ANN 주소를 primary key로 쓴 설계에서 겪은 증폭을 처음부터 피한다.
+2. **문서는 한 번만 저장:** 벡터는 doc id를 참조하고 본문과 속성을 복제하지 않는다.
+3. **안정적인 doc id 기반 속성 인덱스:** 클러스터 리밸런싱이 속성 인덱스를 움직이지 않게 한다.
+4. **한 아키텍처로는 부족:** selectivity 구간별, 문서 모델별 전략을 두고 플래너가 비용 기반으로 고른다.
+5. **Port & Adapter + DDD [결정]:** 주요 컴포넌트는 포트 뒤에 두고 기본 구현은 오픈소스, 교체 가능. 어댑터는 능력과 비용 모델을 선언하고 포트마다 conformance 테스트.
+6. **일관성 [결정]:** 모든 쓰기에 단조 증가 LSN. strong은 최신 manifest 확인 + 미인덱싱 WAL 꼬리 전수 검색 병합, eventual은 캐시된 스냅샷. 벡터와 BM25 모두 "인덱스 + 꼬리 병합".
+7. **tenant와 namespace 식별자를 모든 키와 manifest에 처음부터 포함 [제안].**
+8. **코디네이터 노드 없음 [제안, 가설]:** 메타데이터는 오브젝트 스토리지의 조건부 쓰기(CAS)로 관리하고, 백그라운드 작업은 서비스 노드와 분리해 메모리 상한을 둔다.
+9. **Rust [결정].** hot path는 제네릭으로 인라인하고 포트는 굵은 단위로.
+
+## 6. 아키텍처 (모두 계획)
+
+### 6.1 인덱스와 양자화
+
+- SPANN → SPFresh 계열 클러스터(centroid) 인덱스가 기본. object storage에서는 그래프 기반(DiskANN류)보다 클러스터 단위 읽기가 왕복 횟수 면에서 유리하다(추론).
+- UBIS(스트리밍 업데이트 균형)는 참고. 억 단위 샤딩은 클러스터 트리를 파티션 경계로 삼고 consistent hashing으로 캐시 지역성 확보.
+- 양자화도 포트: 처음에는 무압축, SQ8, 1비트 계열 2~3개. 어댑터가 코드 포맷과 스캔 커널을 함께 제공. 재순위(rerank)는 별도 포트이며 S3 읽기 횟수가 비용 모델에 들어간다.
+
+### 6.2 필터링
+
+- 단순 pre/post-filter가 아니라 벡터 인덱스와 속성 인덱스가 협력하는 native filtering 지향(turbopuffer 선례).
+- 플래너 전략(초안): 매우 selective하면 속성 인덱스로 후보를 구하고 id→vector 조회 후 exact 계산, 중간이면 클러스터별 매칭 수로 후보 클러스터를 고른 뒤 클러스터 안에서 bitmap 필터, 거의 다 통과하면 일반 ANN + post-filter(부족하면 over-fetch). 적응형 탐색: top-k가 찰 때까지 가까운 클러스터부터 확장.
+- 연구 후보: α-Hardness(필터 실패로 인한 over-fetch 비율)를 쿼리 시점 플래너 신호로 쓸 수 있는가.
+
+### 6.3 multi-vector 문서 모델
+
+- 전략 A(기본): 벡터 단위 인덱싱 + 쿼리 연산자로 doc 단위 group-by.
+- 전략 B(선택): MUVERA의 FDE로 item당 벡터 1개로 줄여 인덱싱하고 원본으로 재순위. FDE 차원이 커서 압축이 필요할 수 있다.
+- namespace 단위로 전략 선택.
+
+### 6.4 쓰기와 인제스트
+
+- 쓰기는 WAL(LSN, If-None-Match로 선점) → 비동기 인덱싱. 읽기는 인덱스 + 미인덱싱 꼬리. 쓰기 응답에 LSN 일관성 토큰을 돌려주고 쿼리가 min_lsn을 받게 한다 [제안, Loams 참고].
+- **인제스트 정책(namespace별 설정) [제안]:** 가시성 목표, 그룹 커밋 윈도우, 꼬리 상한, 인덱스 빌드 트리거, 우선순위. 프리셋 realtime / balanced / bulk. bulk는 꼬리 검색을 끄고 끝나면 manifest를 교체해 한 번에 공개.
+- **경로 자동 선택 [제안]:** 변경 비율을 측정해(배치는 시작 전에 키와 해시 컬럼 스캔, 스트리밍은 이동 평균) 파티션 단위로 증분 / 부분 재빌드 / 전체 재빌드를 고른다. 견적은 시간과 비용 범위(가장 싼 안, 균형 안, 가장 빠른 안), 마감 시간·비용 상한·최대 워커 수로 조정. 작업은 파티션 단위 멱등 태스크라 실행 중 워커 증감과 재시도가 가능.
+- 메타데이터만 바뀌면 속성 인덱스만 갱신하고 벡터 클러스터는 건드리지 않는다. 컴팩션과 빌드는 별도 워커.
+
+### 6.5 저장 포맷 [제안, memvid 참고]
+
+- segment 파일 끝에 footer TOC(섹션 오프셋, 길이, SHA-256, 포맷 버전). 끝부분을 range GET으로 읽어 TOC를 얻고 필요한 섹션만 읽는다. 같은 입력이면 같은 바이트(결정성).
+- manifest에 `IndexBinding`(임베딩 모델 id, 차원, 거리 지표, 양자화, 토크나이저 id와 사전 버전)을 기록하고 불일치하면 즉시 실패.
+
+### 6.6 텍스트(BM25)
+
+- Tantivy + lindera(ko-dic) 어댑터 후보 [확인 필요: 사전 라이선스]. 토크나이저는 포트이고 인덱스와 쿼리 시점이 일치해야 한다.
+- 열린 문제: segment와 미인덱싱 꼬리에 걸친 코퍼스 통계(IDF, 평균 문서 길이) 일관성.
+
+### 6.7 OLAP
+
+자체 조인 엔진을 만들지 않는다. SoT를 표준 컬럼너 포맷과 스냅샷 메타데이터로 노출해 외부 엔진이 읽게 한다. 실제 분석 패턴은 불확실(조인 + group by 배치로 추정)이라 M5에서 확정.
+
+### 6.8 포트 후보
+
+저장(ObjectStore, Manifest, Wal), 포맷(SegmentFormat, AttributeIndex), 인덱스(VectorIndex, Quantizer, Reranker), 텍스트(TextIndex, Tokenizer), 쓰기 경로(MemTable, IngestPlanner), 실행(QueryPlanner, Cache, CompactionScheduler), 분산(ShardClient, Router), 관측성(Telemetry), 바인딩(IndexBinding). 포트 스케치는 Rust 설계 문서(LINKS.md)에 있다.
+
+## 7. 개발 순서와 마일스톤
+
+순서 [결정]: 1단계 단일 노드 correctness → 2단계 단일 노드 안의 shard와 분산 구조(shard 간 인터페이스는 초기에 고정) → 3단계 실제 분산 노드. M0를 진행하면서 M1의 기본 단위를 병행하고, 방향이 바뀌면 버려도 된다. M1의 WAL과 manifest는 직접 구현한 뒤 SlateDB 어댑터와 같은 conformance로 비교한다.
+
+| 마일스톤 | 내용 |
+| --- | --- |
+| M0 평가 기반 | 벤치마크 재사용(VectorDBBench 러너, HCBGen 기반 필터 생성기), recall 하네스, 비용 모델, 시나리오 S1~S10, 기준선 확대 |
+| M1 저장 primitive | 불변 segment + manifest + WAL(LSN), 컬럼너 SoT, 검색 가능한 미인덱싱 꼬리, S3 조건부 쓰기 기반 manifest 커밋 |
+| M2 벡터 인덱스 | 클러스터 인덱스 정적 빌드 → 증분 갱신, 양자화 어댑터, Reranker |
+| M3 속성 인덱스 · 필터 · 텍스트 | 속성 인덱스, native filtering과 플래너, BM25/하이브리드(한국어) |
+| M4 업데이트 경로 | 벡터/메타 분리, bulk와 증분 이중 경로, 경로 자동 선택과 견적, 컴팩션 워커 분리 |
+| M5 사내 workload | 배치 쿼리 API, id→vector, multi-vector group-by, FDE 검토, OLAP 노출, 실데이터 재검증 |
+| M6 논문 | M3~M5에서 실제로 새로웠던 결과만 정리 |
+
+현재 상태: M1의 일부(ObjectStore 포트와 메모리 어댑터, 장애 주입, WAL, manifest 커밋, conformance)만 코드가 있고, 컴파일과 테스트 결과는 로컬 확인 중이다.
+
+## 8. 평가(M0) 요약
+
+- **기준선 [결정]:** Chroma, Lance, Milvus, Qdrant, VectorChord. turbopuffer는 계산기 추정.
+- **환경 [결정]:** 로컬 우선(S3 호환 에뮬레이터, 조건부 쓰기를 conformance로 통과한 것만 사용). AWS는 지연 측정에 짧게, 예산은 월 몇 달러 수준. 규모는 머신이 버티는 선까지 설정값으로 올리고 직접 측정 못 한 규모는 외삽으로 표시.
+- **시나리오:** S1 필터 없는 ANN, S2 필터 난이도 스윕, S3 배치 쿼리, S4 multi-vector, S5 업데이트 혼합과 freshness, S6 bulk 간섭, S7 규모별 비용, S8 BM25, S9 멀티테넌트(후속), **S10 운영 단순성과 장애 복구**(구성요소 수와 노드 역할 수, 노드 종료 후 복구, 메모리 제한 하의 병합·빌드에서 서비스 노드 생존).
+- **지표:** recall@10 분포, p50/p99(cold와 warm), QPS, 비용, freshness, 간섭, BM25 정확도, 견적 대비 실제 오차.
+- **bulk 목표 [제안]:** ES 사례(시간당 약 1.2TB) 대비 10배 이상.
+
+## 9. 오픈소스 활용 후보 (라이선스와 현재 상태 확인 필요)
+
+Arrow / Parquet / DataFusion(컬럼너와 OLAP), Rust object_store, SPTAG/SPFresh(참고 구현), Lance 포맷, SlateDB(WAL과 manifest 어댑터 후보), Tantivy + lindera(BM25), Chroma(가장 가까운 선례, 소스 확인 필요), Loams(참고 사례, 메타데이터에 TiKV 사용).
+
+## 10. 열린 연구 질문
+
+1. 필터와 벡터의 상관관계가 강할 때(광고주별 임베딩 군집 등) recall 보장과 selectivity 추정
+2. doc id 기반 속성 인덱스와 클러스터 사이의 변환 비용
+3. 적응형 클러스터 확장의 S3 왕복 비용과 recall의 균형
+4. multi-vector group-by의 over-fetch 최소화, 전략 A와 FDE의 교차 조건
+5. 접근 로그 기반 클러스터 재배치와 SPFresh식 리밸런싱의 충돌 여부
+6. bulk와 컴팩션의 OLTP 격리 방식
+7. α-Hardness를 플래너 신호로 쓰는 방법
+8. OR, range, IN 복합 조건의 selectivity와 난이도 추정, 인덱스 설계
+9. BM25 코퍼스 통계를 segment와 꼬리에 걸쳐 일관되게 유지하는 방법
+10. 한국어 토크나이저 사전 변경 시 재색인 비용
+11. 오브젝트 스토리지 CAS만으로 writer 펜싱과 그룹 커밋을 구현할 때 경합과 PUT 비용의 균형, SlateDB와의 차이
+12. 변경 비율 추정과 경로 자동 선택의 regret, 견적 오차 감소
+13. 코디네이터 없는 구조가 노드 장애와 메모리 압박에서 실제로 더 단순하고 안정적인가 (S10)
+14. 사용자가 "쓴다"고 판단할 최소 조건 (미정)
+
+## 11. 확인하지 못한 것과 위험
+
+- VecBench 코드 공개 여부, HCBGen 라이선스와 동작, VectorDBBench의 클라이언트 범위와 라이선스
+- Chroma 분산 모드의 오픈소스 범위, Lance의 OSS와 Enterprise 경계, SlateDB의 라이선스와 성숙도, Milvus 등 일부 시스템의 최신 라이선스
+- mecab-ko-dic 사전 라이선스, turbopuffer 공식 가격
+- Pinecone 등 비공개 SaaS와 범용 DB의 벡터 기능은 조사하지 않음
+- 합성 필터와 공개 데이터가 광고 데이터의 분포를 대표하지 않을 수 있음(M5에서 재검증)
+- 프로젝트 이름 seabed는 충돌을 확인하지 못함(crates.io, GitHub, 도메인, 상표 직접 확인 필요)
+- 라이선스와 SaaS 운영 주체는 공개 시점에 결정
+
+## 12. 참고 자료
+
+SPANN arXiv 2111.08566 · SPFresh arXiv 2410.14452 · UBIS arXiv 2602.00563 · HNSW arXiv 1603.09320 · MUVERA arXiv 2405.19504 · HCBGen / α-Hardness arXiv 2606.14193 · PathFinder arXiv 2511.00995 · VecBench doi 10.1145/3802125 · VectorDBBench(Zilliz) · turbopuffer 문서(Architecture, native filtering) · memvid MV2 포맷 명세 · Tantivy, lindera · AWS S3 조건부 쓰기 · SlateDB · Loams · Chroma
