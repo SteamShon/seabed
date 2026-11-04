@@ -108,6 +108,7 @@ v0.5 · 2026-11-04 · 대화에서 합의한 내용 기준. v0.5는 계획 리�
 ### 6.5 저장 포맷 [제안, memvid 참고]
 
 - segment 파일 끝에 footer TOC(섹션 오프셋, 길이, SHA-256, 포맷 버전). 끝부분을 range GET으로 읽어 TOC를 얻고 필요한 섹션만 읽는다. 같은 입력이면 같은 바이트(결정성).
+- 구현(M1): `seabed_engine::segment`. 섹션 이름순 배치, TOC 항목마다 SHA-256, footer에 TOC SHA-256·포맷 버전·magic. 크기는 manifest가 기록한다는 전제로 호출자가 넘긴다(HEAD 요청 없음). 끝 4KB를 한 번에 읽어 TOC가 들어 있으면 GET 1회로 열린다.
 - manifest에 `IndexBinding`(임베딩 모델 id, 차원, 거리 지표, 양자화, 토크나이저 id와 사전 버전)을 기록하고 불일치하면 즉시 실패.
 
 ### 6.6 텍스트(BM25)
