@@ -10,6 +10,7 @@ use seabed_engine::manifest::{ManifestError, ManifestStore};
 use seabed_engine::manifest_content::AttrKind;
 use seabed_engine::namespace::{Namespace, NamespaceError, Op};
 use seabed_engine::sot::{AttrValue, SotError};
+use seabed_engine::wal::WalError;
 use seabed_engine::RetryPolicy;
 use seabed_ports::{ObjectMeta, ObjectStore, ObjectStoreCaps, PutCondition, StoreError};
 
@@ -427,6 +428,8 @@ enum PutAction {
     Pass,
     /// Fail without applying the put.
     Fail(StoreError),
+    /// Apply the put, then report this error (a lost response).
+    ApplyThenFail(StoreError),
 }
 
 type GetHook = Box<dyn FnMut(&Key) + Send>;
@@ -478,6 +481,10 @@ impl ObjectStore for Hooked {
         match action {
             PutAction::Pass => self.inner.put(key, data, cond),
             PutAction::Fail(e) => Err(e),
+            PutAction::ApplyThenFail(e) => {
+                self.inner.put(key, data, cond)?;
+                Err(e)
+            }
         }
     }
     fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>, StoreError> {
@@ -491,6 +498,11 @@ impl ObjectStore for Hooked {
 /// True for a manifest version object (not the pointer).
 fn is_manifest_version(key: &Key) -> bool {
     keys().parse_manifest_version(key).is_some()
+}
+
+/// Number of WAL entries in the store.
+fn wal_entries(mem: &MemObjectStore) -> usize {
+    mem.list(&keys().wal_prefix()).unwrap().len()
 }
 
 fn unavailable() -> StoreError {
@@ -658,6 +670,11 @@ fn same_type_new_attr_race_loser_succeeds_after_reload() {
     );
     assert_eq!(content.attr_schema.get("size"), Some(&AttrKind::Str));
     assert_eq!(ids(&ns(&mem).read_all().unwrap()), ["l", "seed", "w"]);
+    assert_eq!(
+        wal_entries(&mem),
+        3,
+        "seed, winner, loser: the loser appended exactly once"
+    );
     assert!(ns(&mem).flush().unwrap().is_some());
 }
 
@@ -746,9 +763,7 @@ fn write_request_cost_is_pinned() {
 fn failed_append_after_schema_commit_keeps_the_type_and_retries_cleanly() {
     let mem = Arc::new(MemObjectStore::new());
     let hooked = Hooked::new(&mem);
-    let n = Namespace::new(hooked.clone(), keys(), DIMS)
-        .unwrap()
-        .with_retry_policy(RetryPolicy::immediate(2));
+    let n = Namespace::new(hooked.clone(), keys(), DIMS).unwrap();
     let wal_down = Arc::new(AtomicBool::new(true));
     let down = wal_down.clone();
     let wal_prefix = keys().wal_prefix();
@@ -760,7 +775,12 @@ fn failed_append_after_schema_commit_keeps_the_type_and_retries_cleanly() {
         }
     });
     let batch = [Op::upsert("a", vec![]).with_attr("size", AttrValue::Str("s".into()))];
-    assert!(matches!(n.write(7, &batch), Err(NamespaceError::Wal(_))));
+    // The WAL resolves each unclear put (NotFound) and tries the next one until it gives up.
+    assert_eq!(
+        n.write(7, &batch),
+        Err(NamespaceError::Wal(WalError::TooManyAttempts))
+    );
+    assert_eq!(wal_entries(&mem), 0);
 
     let (_, content) = latest_manifest(&mem);
     assert_eq!(
@@ -779,5 +799,60 @@ fn failed_append_after_schema_commit_keeps_the_type_and_retries_cleanly() {
     wal_down.store(false, SeqCst);
     n.write(7, &batch).unwrap();
     assert_eq!(ids(&n.read_all().unwrap()), ["a"]);
+    assert_eq!(wal_entries(&mem), 1);
     assert!(n.flush().unwrap().is_some());
+}
+
+/// The schema commit lands but its response is lost. The writer must recognise its own commit
+/// (same commit id), append exactly once, and commit no second version.
+#[test]
+fn schema_commit_with_lost_response_adopts_own_commit_and_appends_once() {
+    let mem = Arc::new(MemObjectStore::new());
+    let hooked = Hooked::new(&mem);
+    let n = Namespace::new(hooked.clone(), keys(), DIMS).unwrap();
+    let ran = Arc::new(AtomicBool::new(false));
+    let ran2 = ran.clone();
+    hooked.on_put(move |key| {
+        if is_manifest_version(key) && !ran2.swap(true, SeqCst) {
+            PutAction::ApplyThenFail(unavailable())
+        } else {
+            PutAction::Pass
+        }
+    });
+    n.write(1, &[Op::upsert("a", vec![]).with_attr("size", price(1))])
+        .unwrap();
+    assert!(ran.load(SeqCst));
+    let (v, content) = latest_manifest(&mem);
+    assert_eq!(v.get(), 1, "one schema version, no second commit");
+    assert_eq!(content.attr_schema.get("size"), Some(&AttrKind::I64));
+    assert_eq!(wal_entries(&mem), 1);
+    assert_eq!(ids(&n.read_all().unwrap()), ["a"]);
+    assert!(n.flush().unwrap().is_some());
+}
+
+/// A schema commit failing with a non-retryable store error is returned at once: no reload loop,
+/// no WAL append.
+#[test]
+fn schema_commit_store_error_is_returned_not_retried() {
+    let mem = Arc::new(MemObjectStore::new());
+    let hooked = Hooked::new(&mem);
+    let n = Namespace::new(hooked.clone(), keys(), DIMS).unwrap();
+    let puts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let puts2 = puts.clone();
+    hooked.on_put(move |key| {
+        if is_manifest_version(key) {
+            puts2.fetch_add(1, SeqCst);
+            PutAction::Fail(StoreError::Unsupported("injected"))
+        } else {
+            PutAction::Pass
+        }
+    });
+    assert_eq!(
+        n.write(1, &[Op::upsert("a", vec![]).with_attr("size", price(1))]),
+        Err(NamespaceError::Manifest(ManifestError::Store(
+            StoreError::Unsupported("injected")
+        )))
+    );
+    assert_eq!(puts.load(SeqCst), 1, "not retried");
+    assert_eq!(wal_entries(&mem), 0);
 }
