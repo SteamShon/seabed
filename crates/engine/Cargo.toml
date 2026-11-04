@@ -9,6 +9,13 @@ seabed-domain = { path = "../domain" }
 seabed-ports = { path = "../ports" }
 seabed-adapter-objectstore-retry = { path = "../adapter-objectstore-retry" }
 sha2 = "0.11"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+parquet = { version = "60.1", default-features = false, features = ["arrow", "snap"] }
+arrow-array = "60.1"
+arrow-schema = "60.1"
+bytes = "1"
 
 [dev-dependencies]
 seabed-adapter-objectstore-mem = { path = "../adapter-objectstore-mem" }
+proptest = "1"

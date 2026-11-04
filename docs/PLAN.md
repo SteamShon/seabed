@@ -120,6 +120,7 @@ v0.5 · 2026-11-04 · 대화에서 합의한 내용 기준. v0.5는 계획 리�
 - segment 파일 끝에 footer TOC(섹션 오프셋, 길이, SHA-256, 포맷 버전). 끝부분을 range GET으로 읽어 TOC를 얻고 필요한 섹션만 읽는다. 같은 입력이면 같은 바이트(결정성).
 - 구현(M1): `seabed_engine::segment`. 섹션 이름순 배치, TOC 항목마다 SHA-256, footer에 TOC SHA-256·포맷 버전·magic. 크기는 manifest가 기록한다는 전제로 호출자가 넘긴다(HEAD 요청 없음). 끝 4KB를 한 번에 읽어 TOC가 들어 있으면 GET 1회로 열린다.
 - manifest에 `IndexBinding`(임베딩 모델 id, 차원, 거리 지표, 양자화, 토크나이저 id와 사전 버전)을 기록하고 불일치하면 즉시 실패.
+- 구현(M1): manifest payload는 `seabed_engine::manifest_content::ManifestContent`(JSON, 필드 순서 고정이라 결정적). tenant·namespace, `indexed_through`(이 LSN까지는 segment에 있고 그 뒤가 미인덱싱 꼬리), `IndexBinding`(처음 쓴 값으로 고정, 다른 값이면 어느 필드가 다른지와 함께 실패), segment 목록(id, 크기, TOC SHA-256)을 담는다. `SegmentStore::open_ref`는 기록된 TOC 해시와 실제 객체를 비교한다.
 
 ### 6.6 텍스트(BM25)
 
@@ -128,7 +129,11 @@ v0.5 · 2026-11-04 · 대화에서 합의한 내용 기준. v0.5는 계획 리�
 
 ### 6.7 OLAP
 
-자체 조인 엔진을 만들지 않는다. SoT를 표준 컬럼너 포맷과 스냅샷 메타데이터로 노출해 외부 엔진이 읽게 한다. 실제 분석 패턴은 불확실(조인 + group by 배치로 추정)이라 M5에서 확정.
+자체 조인 엔진을 만들지 않는다. SoT를 표준 컬럼너 포맷과 스냅샷 메타데이터로 노출해 외부 엔진이 읽게 한다.
+
+구현(M1): `seabed_engine::sot`. segment마다 `segments/<id>/docs.parquet`를 둔다. 이 파일은 seabed 컨테이너(`.sbsg`) 안이 아니라 독립된 Parquet 객체라서 DuckDB 같은 외부 엔진이 그대로 읽는다. 컬럼은 `id`, `lsn`, `deleted`(tombstone), `vectors`(list<fixed_size_list<f32, dims>>), 속성마다 nullable 컬럼(utf8/int64/float64/bool) 하나씩이다. 행은 id 순으로 정렬되고 id가 겹치지 않는다. 같은 Parquet writer 버전이면 같은 행은 같은 바이트로 인코딩된다. writer 버전이 바뀌면 바이트가 달라질 수 있으며, manifest는 실제로 쓴 바이트의 크기와 SHA-256을 기록한다. 파일 메타데이터에 `seabed.sot.format_version`과 `seabed.sot.dims`를 기록하고 읽을 때 확인한다. `lsn`은 Spark 등 외부 엔진 호환을 위해 int64로 저장한다(`i64::MAX` 초과 거부). manifest content v2의 segment는 `docs`(SoT 파일의 크기와 SHA-256, 필수)와 `index`(`.sbsg` 컨테이너, 선택)를 가진다. SoT가 원본이고 인덱스는 파생이라는 5.1 원칙을 그대로 따른다. 미인덱싱 꼬리 병합 읽기는 `Namespace::read_all`이 한다.
+
+**[결정] namespace 단위 속성 스키마 (구현됨).** manifest의 `attr_schema`(이름→타입)가 모든 SoT 파일의 열 타입을 정한다. 스키마는 추가만 허용되고 기존 속성의 타입 변경이나 삭제는 커밋 단계(`check_successor`)에서 거부된다. 새 속성의 타입은 write가 정한다. `seabed_engine::namespace::Namespace::write`는 묶음이 새 속성을 쓰면 WAL에 붙이기 전에 스키마를 넓힌 manifest를 조건부로 먼저 커밋하고, 충돌하면 아무것도 붙이지 않고 거부한다. 경합에서 진 writer는 다시 읽고 같은 타입이면 진행, 다른 타입이면 거부된다. 그래서 WAL에는 스키마와 맞는 묶음만 들어간다. 이 커밋 뒤 WAL append가 실패해도 속성 타입은 예약된 채 남는다(스키마는 커지기만 하므로 안전). flush의 순서는 "행의 속성으로 스키마를 넓히고(가드, 보통은 아무것도 추가하지 않음) → 그 스키마로 SoT를 쓰고 → 커밋"이고 `Namespace::flush`가 구현한다. write의 스키마 커밋도 flush와 같은 manifest CAS에 참여하므로, 새 속성 write와 겹친 flush는 `CommitConflict`로 끝나고 다시 시도하면 된다. segment id는 WAL 범위와, 범위 밖에서 바이트를 정하는 입력(속성 스키마, dims, SoT 포맷 버전, Parquet writer 버전; encode 출력을 바꾸면 포맷 버전을 올린다)의 지문으로 정해진다(`w<첫 LSN>-<끝 LSN>-<지문>`). 입력이 같으면 같은 id와 같은 바이트가 되어 `SotStore::write`가 성공으로 받고(재시도, 같은 범위 경합, 응답 유실), 입력이 다르면 id가 달라 서로를 막지 않는다(스키마가 커진 뒤 같은 범위를 다시 flush하거나 롤링 업그레이드). manifest 커밋 id는 커밋 내용의 해시다. 같은 범위의 경합은 고아를 남기지 않는다. 다만 두 flush가 같은 manifest에서 출발해 WAL 끝을 서로 다르게 읽으면 범위가 달라 id도 달라지므로, 진 쪽 파일은 여전히 고아가 된다. 고아는 GC 대상이다(아직 없음). encode는 스키마의 모든 열을 nullable로 쓰고, decode는 스키마에 없거나 타입이 다른 열을 거부하되 스키마가 커지기 전에 쓴 파일(열이 적음)은 받아들인다. 그래서 파일마다 열 타입이 달라지는 일은 없다. 다만 오래된 파일은 새 열이 없으므로, 외부 엔진은 glob이 아니라 manifest의 파일 목록을 읽고 열을 이름으로 합쳐야(예: DuckDB `union_by_name`) 스냅샷이 된다.
 
 ### 6.8 포트 후보
 
@@ -158,7 +163,7 @@ v0.5 · 2026-11-04 · 대화에서 합의한 내용 기준. v0.5는 계획 리�
 
 **최소 검증 경로 [제안]:** 혼자 개발하는 규모를 고려해, 가설 검증에 꼭 필요한 M1 → M2(정적 빌드) → M3(필터 플래너) → M4(bulk 분리) → M4.5를 먼저 끝낸다. BM25/한국어, OLAP 노출, FDE, 증분 클러스터 갱신의 고도화는 그 뒤로 미룰 수 있다.
 
-현재 상태: M1의 일부(ObjectStore 포트와 메모리 어댑터, 장애 주입, WAL, manifest 커밋, conformance)만 코드가 있다. 2026-11-04 기준 `cargo test --workspace`가 컴파일되고 모든 테스트가 통과한다. 최신 manifest 포인터(`If-Match` 전진 + 앞으로 탐색, 읽기 GET 약 3회)가 있다.
+현재 상태: M1의 일부(ObjectStore 포트와 메모리 어댑터, 장애 주입, WAL, manifest 커밋, conformance)만 코드가 있다. 2026-11-04 기준 `cargo test --workspace`가 컴파일되고 모든 테스트가 통과한다. 최신 manifest 포인터(`If-Match` 전진 + 앞으로 탐색, 읽기 GET 약 3회)가 있다. segment 포맷과 타입이 있는 manifest 내용(segment 목록, `indexed_through`, `IndexBinding`)이 있다. Parquet SoT 파일(쓰기·읽기·검증)과, 이를 manifest에 연결하는 segment 참조(`docs` 필수, `index` 선택)와 namespace 속성 스키마가 있다. `Namespace`가 쓰기(WAL 레코드 v1: upsert/delete 묶음, 쓰기 전에 검증), flush(WAL 꼬리 → segment SoT → manifest 커밋), strong 읽기(모든 segment + `indexed_through` 이후 WAL 꼬리를 LSN이 가장 큰 행으로 병합, tombstone 반영)를 제공한다. 이로써 M1의 기능 범위는 채워졌다. 새 속성은 write가 WAL에 붙이기 전에 스키마를 넓힌 manifest를 먼저 커밋하므로, 타입 충돌은 순차든 경합이든 항상 write에서 거부되고 flush가 막히지 않는다. WAL 레코드는 `float_roundtrip`으로 f32·f64를 비트 그대로 보존한다. 남은 것: 고아 SoT GC, 읽기 때마다 모든 segment와 꼬리를 다 읽는 비용(strong 읽기 1회에 manifest GET 3 + segment마다 GET 1 + WAL LIST 1 + 꼬리 항목마다 GET 1, 테스트로 고정; 인덱스는 M2부터), WAL GC는 읽을 수 있는 모든 manifest의 `indexed_through` 이하만 지울 수 있다.
 
 ## 8. 평가(M0) 요약
 
