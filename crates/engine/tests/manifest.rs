@@ -272,8 +272,12 @@ fn malformed_pointer_is_reported_as_corrupt() {
 /// 4. the next confirming GET succeeds and shows the object is ours.
 ///
 /// The writer must report success, not a conflict with itself.
+///
+/// Faults and counters apply only to the version-1 manifest key, so pointer traffic or a
+/// change in call order cannot shift the script onto another request.
 struct LostThenRejected {
     inner: MemObjectStore,
+    target: Key,
     puts: std::sync::atomic::AtomicUsize,
     gets: std::sync::atomic::AtomicUsize,
 }
@@ -284,7 +288,7 @@ impl ObjectStore for LostThenRejected {
     }
     fn get(&self, key: &Key) -> Result<(Vec<u8>, ETag), StoreError> {
         use std::sync::atomic::Ordering::SeqCst;
-        if self.gets.fetch_add(1, SeqCst) == 0 {
+        if *key == self.target && self.gets.fetch_add(1, SeqCst) == 0 {
             return Err(StoreError::Unavailable(
                 "scripted: confirm GET fails".into(),
             ));
@@ -297,7 +301,7 @@ impl ObjectStore for LostThenRejected {
     fn put(&self, key: &Key, data: Vec<u8>, cond: PutCondition) -> Result<ETag, StoreError> {
         use std::sync::atomic::Ordering::SeqCst;
         let result = self.inner.put(key, data, cond);
-        if self.puts.fetch_add(1, SeqCst) == 0 {
+        if *key == self.target && self.puts.fetch_add(1, SeqCst) == 0 {
             assert!(result.is_ok());
             return Err(StoreError::Unavailable("scripted: response lost".into()));
         }
@@ -315,6 +319,7 @@ impl ObjectStore for LostThenRejected {
 fn own_commit_is_recognised_after_lost_response_then_precondition_failed() {
     let store = Arc::new(LostThenRejected {
         inner: MemObjectStore::new(),
+        target: keys().manifest_key(Version::new(1)),
         puts: Default::default(),
         gets: Default::default(),
     });
@@ -324,12 +329,14 @@ fn own_commit_is_recognised_after_lost_response_then_precondition_failed() {
         .with_retry_policy(RetryPolicy::immediate(1));
 
     assert_eq!(ms.commit(None, 77, b"mine").unwrap(), Version::new(1));
+    // Exactly the scripted path, counted before the reads below add their own GET:
+    // lost put, failed confirm, rejected retry, good confirm.
+    use std::sync::atomic::Ordering::SeqCst;
+    assert_eq!(store.puts.load(SeqCst), 2, "manifest puts");
+    assert_eq!(store.gets.load(SeqCst), 2, "manifest confirm GETs");
+
     let latest = ms.load_latest().unwrap().unwrap();
     assert_eq!(latest.version, Version::new(1), "no duplicate version");
     assert_eq!(latest.commit_id, 77);
     assert_eq!(latest.payload, b"mine");
-    assert!(
-        store.puts.load(std::sync::atomic::Ordering::SeqCst) >= 2,
-        "the retry path was taken"
-    );
 }

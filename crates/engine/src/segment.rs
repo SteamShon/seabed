@@ -53,6 +53,8 @@ pub enum SegmentError {
     /// Only same-size replacements are told apart this way. An object of a different size fails
     /// earlier, while reading the footer at the recorded size, and surfaces as `Corrupt` (or a
     /// store range error), because the bytes at the expected footer position are not a footer.
+    /// One case is not detected at all: a larger object whose first `size` bytes are the
+    /// original segment. That is harmless, because every byte read is the recorded one.
     RefMismatch {
         id: String,
     },

@@ -731,3 +731,26 @@ fn open_ref_with_a_smaller_replacement_is_not_ref_mismatch() {
         "a smaller object is caught before the hash check: {err:?}"
     );
 }
+
+#[test]
+fn open_ref_accepts_a_replacement_that_keeps_the_original_bytes_as_a_prefix() {
+    // Documented boundary: only the recorded `size` bytes are read, and they are unchanged.
+    let mem = Arc::new(MemObjectStore::new());
+    let k = keys();
+    let segs = SegmentStore::new(mem.clone()).unwrap();
+    let mut b = SegmentBuilder::new();
+    b.add("vectors", vec![1u8; 16]).unwrap();
+    let recorded = segs.write_segment(&k, "seg-0001", &b).unwrap();
+
+    let mut extended = b.encode();
+    extended.extend_from_slice(b"trailing garbage");
+    mem.put(
+        &k.segment_key("seg-0001", DATA_FILE),
+        extended,
+        PutCondition::Unconditional,
+    )
+    .unwrap();
+
+    let r = segs.open_ref(&k, &recorded).unwrap();
+    assert_eq!(r.read("vectors").unwrap(), vec![1u8; 16]);
+}
