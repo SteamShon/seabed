@@ -389,11 +389,20 @@ impl ManifestContent {
 
     /// Decodes and validates content read from `keys`' manifest.
     pub fn decode(bytes: &[u8], keys: &NamespaceKeys) -> Result<Self, ContentError> {
+        // Read the version alone first. The full struct denies unknown fields, so an older or
+        // newer layout would otherwise fail as a generic decode error and callers could not
+        // tell "other format version" from "damaged".
+        #[derive(Deserialize)]
+        struct VersionOnly {
+            format_version: u32,
+        }
+        let probe: VersionOnly =
+            serde_json::from_slice(bytes).map_err(|e| ContentError::Decode(e.to_string()))?;
+        if probe.format_version != CONTENT_FORMAT_VERSION {
+            return Err(ContentError::UnsupportedVersion(probe.format_version));
+        }
         let c: ManifestContent =
             serde_json::from_slice(bytes).map_err(|e| ContentError::Decode(e.to_string()))?;
-        if c.format_version != CONTENT_FORMAT_VERSION {
-            return Err(ContentError::UnsupportedVersion(c.format_version));
-        }
         let (tenant, namespace) = (keys.tenant().to_string(), keys.namespace().to_string());
         if c.tenant != tenant || c.namespace != namespace {
             return Err(ContentError::WrongNamespace {

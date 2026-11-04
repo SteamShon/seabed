@@ -773,3 +773,58 @@ fn decode_validates_across_row_groups() {
     unsorted.ids = vec![Some("b"), Some("a")];
     assert!(is_format(decode(&two_row_groups(unsorted), DIMS)));
 }
+
+/// Deferred from PR #13 review (M8): the per-column schema check must also catch columns
+/// whose values are all null, which row-level validation never sees.
+#[test]
+fn decode_refuses_an_all_null_column_outside_the_schema_or_of_another_type() {
+    use arrow_array::Float64Array;
+    let cases: [(&str, Field, ArrayRef); 2] = [
+        (
+            "not in schema",
+            Field::new("weight", DataType::Utf8, true),
+            Arc::new(StringArray::from(vec![None::<&str>])),
+        ),
+        (
+            "other type",
+            Field::new("price", DataType::Float64, true), // schema says i64
+            Arc::new(Float64Array::from(vec![None::<f64>])),
+        ),
+    ];
+    for (why, field, col) in cases {
+        let name = field.name().clone();
+        let mut f = Foreign::one([1.0, 2.0, 3.0]);
+        f.extra = vec![(field, col)];
+        assert_eq!(
+            decode(&f.bytes(), DIMS).unwrap_err(),
+            SotError::SchemaMismatch { name },
+            "{why}"
+        );
+    }
+}
+
+proptest! {
+    /// With a schema wider than the rows use (unused columns), the file still roundtrips and
+    /// re-encodes to the same bytes.
+    #[test]
+    fn rows_roundtrip_with_a_schema_superset(
+        rows in arb_rows(),
+        extra in proptest::collection::btree_map(
+            "x[a-z0-9_]{0,8}",
+            prop_oneof![
+                Just(AttrKind::Str),
+                Just(AttrKind::I64),
+                Just(AttrKind::F64),
+                Just(AttrKind::Bool),
+            ],
+            0..4,
+        ),
+    ) {
+        let mut schema = schema_of(&rows).unwrap();
+        schema.extend(extra);
+        let bytes = sot::encode(&rows, &schema, DIMS).unwrap();
+        let back = sot::decode(&bytes, &schema, DIMS).unwrap();
+        prop_assert_eq!(&back, &sorted(rows));
+        prop_assert_eq!(sot::encode(&back, &schema, DIMS).unwrap(), bytes);
+    }
+}

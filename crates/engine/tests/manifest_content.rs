@@ -970,3 +970,84 @@ fn flushes_with_a_growing_schema_read_back_consistently_and_type_changes_are_ref
         SotError::UnknownAttr("size".into())
     );
 }
+
+// ---- Added after PR #13 round-1 review ----
+
+#[test]
+fn decode_reports_a_v1_manifest_as_unsupported_version() {
+    // The exact v1 layout: segments carried size/toc_sha256 directly and there was no
+    // attr_schema. It must read as "other version", not as a damaged manifest.
+    let v1 = format!(
+        r#"{{"format_version":1,"tenant":"acme","namespace":"ads","indexed_through":null,"index_binding":null,"segments":[{{"id":"seg-0001","size":100,"toc_sha256":"{}"}}]}}"#,
+        "ab".repeat(32)
+    );
+    assert_eq!(
+        ManifestContent::decode(v1.as_bytes(), &keys()).unwrap_err(),
+        ContentError::UnsupportedVersion(1)
+    );
+}
+
+#[test]
+fn open_ref_rejects_an_invalid_segment_id() {
+    let segs = SegmentStore::new(Arc::new(MemObjectStore::new())).unwrap();
+    let index = IndexRef {
+        size: 100,
+        toc_sha256: Sha256Hex([0; 32]),
+    };
+    assert_eq!(
+        segs.open_ref(&keys(), "../x", &index).err(),
+        Some(SegmentError::InvalidSegmentId("../x".into()))
+    );
+}
+
+/// Two writers start from the same manifest and widen the schema with conflicting types.
+/// Exactly one commits; the loser sees the conflict on reload; its already-written SoT file
+/// stays behind as an orphan the manifest never lists (GC's job, documented in PLAN 6.7).
+#[test]
+fn racing_flushes_with_conflicting_attr_types_commit_only_one() {
+    let mem = Arc::new(MemObjectStore::new());
+    let ms = ManifestStore::new(mem.clone(), keys()).unwrap();
+    let sots = SotStore::new(mem.clone());
+    let v1 = ms
+        .commit_content(None, 1, &ManifestContent::empty(&keys()))
+        .unwrap();
+
+    let (_, base) = ms.load_latest_content().unwrap().unwrap();
+    let writer = |id: &str, value: AttrValue, commit_id: u64| {
+        let rows = vec![DocRow::upsert(id, commit_id, vec![]).with_attr("price", value)];
+        let mut c = base.clone();
+        c.extend_attr_schema(&schema_of(&rows).unwrap()).unwrap();
+        let docs = sots.write(&keys(), id, &rows, &c.attr_schema, 3).unwrap();
+        c.add_segment(SegmentRef {
+            id: id.into(),
+            docs,
+            index: None,
+        })
+        .unwrap();
+        ms.commit_content(Some(v1), commit_id, &c)
+    };
+    writer("seg-a", AttrValue::I64(1), 10).unwrap();
+    assert_eq!(
+        writer("seg-b", AttrValue::F64(1.5), 11).unwrap_err(),
+        ManifestError::CommitConflict
+    );
+
+    // The loser reloads and now sees the schema conflict.
+    let (_, latest) = ms.load_latest_content().unwrap().unwrap();
+    let mut retry = latest.clone();
+    assert!(matches!(
+        retry.extend_attr_schema(&schema(&[("price", AttrKind::F64)])),
+        Err(ContentError::AttrSchemaChanged { .. })
+    ));
+
+    // Only the winner is listed, and everything listed reads with the manifest schema.
+    let ids: Vec<_> = latest.segments.iter().map(|s| s.id.as_str()).collect();
+    assert_eq!(ids, ["seg-a"]);
+    for s in &latest.segments {
+        sots.read(&keys(), &s.id, &s.docs, &latest.attr_schema, 3)
+            .unwrap();
+    }
+    // The loser's file exists but is unreferenced.
+    let orphans: Vec<_> = mem.list(keys().segment_key("seg-b", "").as_str()).unwrap();
+    assert_eq!(orphans.len(), 1, "one orphan SoT file, for GC");
+}
