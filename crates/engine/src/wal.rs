@@ -38,6 +38,9 @@ pub struct WalEntry {
     pub payload: Vec<u8>,
 }
 
+/// `read_from` and the log-end lookup return transient store errors as they are. Wrap the store
+/// in `seabed_adapter_objectstore_retry::Retrying` to retry them with backoff. `append` resolves
+/// ambiguous writes itself and must see raw `put` outcomes, which `Retrying` passes through.
 pub struct Wal<S: ObjectStore> {
     store: Arc<S>,
     keys: NamespaceKeys,

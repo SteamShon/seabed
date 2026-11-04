@@ -3,9 +3,35 @@
 version = 4
 
 [[package]]
+name = "backon"
+version = "1.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cffb0e931875b666fc4fcb20fee52e9bbd1ef836fd9e9e04ec21555f9f85f7ef"
+dependencies = [
+ "fastrand",
+]
+
+[[package]]
+name = "fastrand"
+version = "2.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
+
+[[package]]
 name = "seabed-adapter-objectstore-mem"
 version = "0.0.1"
 dependencies = [
+ "seabed-domain",
+ "seabed-ports",
+]
+
+[[package]]
+name = "seabed-adapter-objectstore-retry"
+version = "0.0.1"
+dependencies = [
+ "backon",
+ "seabed-adapter-objectstore-mem",
+ "seabed-conformance",
  "seabed-domain",
  "seabed-ports",
 ]
@@ -28,6 +54,7 @@ name = "seabed-engine"
 version = "0.0.1"
 dependencies = [
  "seabed-adapter-objectstore-mem",
+ "seabed-adapter-objectstore-retry",
  "seabed-domain",
  "seabed-ports",
 ]

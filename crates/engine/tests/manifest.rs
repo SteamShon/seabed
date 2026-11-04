@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::thread;
 
 use seabed_adapter_objectstore_mem::{FaultConfig, FaultInjecting, MemObjectStore};
+use seabed_adapter_objectstore_retry::{RetryPolicy, Retrying};
 use seabed_domain::{NamespaceId, NamespaceKeys, TenantId, Version};
 use seabed_engine::manifest::{ManifestError, ManifestStore};
 
@@ -84,8 +85,10 @@ fn concurrent_commits_survive_injected_faults() {
         put_lose_response_ppm: 200_000,
         put_conflict_ppm: 50_000,
         get_unavailable_ppm: 50_000,
+        list_unavailable_ppm: 50_000,
     };
-    let faulty = Arc::new(FaultInjecting::new(mem, cfg));
-    let ms = ManifestStore::new(faulty, keys()).unwrap();
+    let faulty = FaultInjecting::new(mem, cfg);
+    let store = Arc::new(Retrying::new(faulty, RetryPolicy::immediate(32)));
+    let ms = ManifestStore::new(store, keys()).unwrap();
     run_contended_commits(&ms);
 }

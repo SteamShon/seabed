@@ -129,6 +129,7 @@ crates/
   domain/                  도메인 타입과 키 레이아웃 (tenant, namespace 포함)
   ports/                   ObjectStore 트레이트와 능력 선언
   adapter-objectstore-mem/ 메모리 구현, 요청 수 계수, 장애 주입 데코레이터
+  adapter-objectstore-retry/ 읽기 일시 오류를 backoff로 재시도하는 데코레이터 (backon)
   engine/                  WAL(LSN 선점), manifest 커밋
   conformance/             어떤 ObjectStore 어댑터에도 돌리는 공통 테스트
 docs/

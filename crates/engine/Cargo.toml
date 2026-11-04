@@ -10,3 +10,4 @@ seabed-ports = { path = "../ports" }
 
 [dev-dependencies]
 seabed-adapter-objectstore-mem = { path = "../adapter-objectstore-mem" }
+seabed-adapter-objectstore-retry = { path = "../adapter-objectstore-retry" }

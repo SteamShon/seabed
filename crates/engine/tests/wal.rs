@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::thread;
 
 use seabed_adapter_objectstore_mem::{CountingObjectStore, FaultConfig, FaultInjecting, MemObjectStore};
+use seabed_adapter_objectstore_retry::{RetryPolicy, Retrying};
 use seabed_domain::{Lsn, NamespaceId, NamespaceKeys, TenantId};
 use seabed_engine::wal::Wal;
 
@@ -74,9 +75,14 @@ fn lost_responses_do_not_duplicate_or_lose_entries() {
         put_lose_response_ppm: 200_000,
         put_conflict_ppm: 50_000,
         get_unavailable_ppm: 100_000,
+        list_unavailable_ppm: 100_000,
     };
-    let faulty = Arc::new(FaultInjecting::new(mem.clone(), cfg));
-    let wal = Wal::new(faulty, keys()).unwrap();
+    let faulty = FaultInjecting::new(mem.clone(), cfg);
+    let wal = Wal::new(
+        Arc::new(Retrying::new(faulty, RetryPolicy::immediate(32))),
+        keys(),
+    )
+    .unwrap();
 
     thread::scope(|sc| {
         for t in 0..4u64 {
@@ -112,4 +118,35 @@ fn request_counts_are_observable() {
     // One list to find the log end, then one successful put per append.
     assert_eq!(stats.puts, 10);
     assert_eq!(stats.lists, 1);
+}
+
+#[test]
+fn reads_survive_injected_read_faults_through_retrying() {
+    let mem = Arc::new(MemObjectStore::new());
+    let writer = Wal::new(mem.clone(), keys()).unwrap();
+    for i in 1..=30u64 {
+        writer.append(i, &i.to_le_bytes()).unwrap();
+    }
+
+    let cfg = FaultConfig {
+        seed: 9,
+        get_unavailable_ppm: 200_000,
+        list_unavailable_ppm: 200_000,
+        ..FaultConfig::none()
+    };
+    let faulty = FaultInjecting::new(mem.clone(), cfg);
+
+    // Without retries the first injected fault surfaces to the caller.
+    let raw = Wal::new(Arc::new(FaultInjecting::new(mem, cfg)), keys()).unwrap();
+    assert!((0..20).any(|_| raw.read_from(Lsn::new(1)).is_err()));
+
+    let reader = Wal::new(
+        Arc::new(Retrying::new(faulty, RetryPolicy::immediate(32))),
+        keys(),
+    )
+    .unwrap();
+    for _ in 0..20 {
+        let entries = reader.read_from(Lsn::new(1)).unwrap();
+        assert_eq!(entries.len(), 30);
+    }
 }

@@ -4,6 +4,7 @@ members = [
     "crates/domain",
     "crates/ports",
     "crates/adapter-objectstore-mem",
+    "crates/adapter-objectstore-retry",
     "crates/engine",
     "crates/conformance",
 ]

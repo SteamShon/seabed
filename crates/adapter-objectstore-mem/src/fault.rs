@@ -6,8 +6,8 @@ use seabed_ports::{ObjectMeta, ObjectStore, ObjectStoreCaps, PutCondition, Store
 
 use crate::lock;
 
-/// Probabilities are in parts per million. Only `put`, `get` and `get_range` are affected;
-/// `list` and `delete` are passed through (latency injection is not implemented yet).
+/// Probabilities are in parts per million. `put`, `get`, `get_range` and `list` are affected;
+/// `delete` is passed through (latency injection is not implemented yet).
 #[derive(Debug, Clone, Copy)]
 pub struct FaultConfig {
     pub seed: u64,
@@ -18,6 +18,7 @@ pub struct FaultConfig {
     /// A conditional put is rejected with `Conflict` without being applied (HTTP 409).
     pub put_conflict_ppm: u32,
     pub get_unavailable_ppm: u32,
+    pub list_unavailable_ppm: u32,
 }
 
 impl FaultConfig {
@@ -28,6 +29,7 @@ impl FaultConfig {
             put_lose_response_ppm: 0,
             put_conflict_ppm: 0,
             get_unavailable_ppm: 0,
+            list_unavailable_ppm: 0,
         }
     }
 }
@@ -121,6 +123,9 @@ impl<S: ObjectStore> ObjectStore for FaultInjecting<S> {
     }
 
     fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>, StoreError> {
+        if self.roll(self.cfg.list_unavailable_ppm) {
+            return Err(StoreError::Unavailable("injected: list failed".into()));
+        }
         self.inner.list(prefix)
     }
 

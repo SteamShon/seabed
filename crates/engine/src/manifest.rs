@@ -35,6 +35,9 @@ pub struct Manifest {
     pub payload: Vec<u8>,
 }
 
+/// Reads (`load`, `load_latest`) return transient store errors as they are. Wrap the store in
+/// `seabed_adapter_objectstore_retry::Retrying` to retry them with backoff. `commit` resolves
+/// ambiguous writes itself and must see raw `put` outcomes, which `Retrying` passes through.
 pub struct ManifestStore<S: ObjectStore> {
     store: Arc<S>,
     keys: NamespaceKeys,
@@ -68,34 +71,16 @@ impl<S: ObjectStore> ManifestStore<S> {
         })
     }
 
-    /// Runs a read, retrying transient `Unavailable` errors. Reads have no side effects, so a
-    /// retry is always safe; other errors are returned at once.
-    fn read_with_retry<T>(
-        &self,
-        mut op: impl FnMut() -> Result<T, StoreError>,
-    ) -> Result<T, ManifestError> {
-        let mut last = None;
-        for _ in 0..self.max_attempts {
-            match op() {
-                Err(e @ StoreError::Unavailable(_)) => last = Some(e),
-                other => return other.map_err(Into::into),
-            }
-        }
-        Err(last.map_or(ManifestError::TooManyAttempts, Into::into))
-    }
-
     pub fn load(&self, version: Version) -> Result<Option<Manifest>, ManifestError> {
-        let key = self.keys.manifest_key(version);
-        match self.read_with_retry(|| self.store.get(&key)) {
+        match self.store.get(&self.keys.manifest_key(version)) {
             Ok((bytes, _)) => Ok(Some(Self::parse(version, &bytes)?)),
-            Err(ManifestError::Store(StoreError::NotFound)) => Ok(None),
-            Err(e) => Err(e),
+            Err(StoreError::NotFound) => Ok(None),
+            Err(e) => Err(e.into()),
         }
     }
 
     pub fn load_latest(&self) -> Result<Option<Manifest>, ManifestError> {
-        let prefix = self.keys.manifest_prefix();
-        let metas = self.read_with_retry(|| self.store.list(&prefix))?;
+        let metas = self.store.list(&self.keys.manifest_prefix())?;
         let latest = metas
             .iter()
             .filter_map(|m| self.keys.parse_manifest_version(&m.key))
