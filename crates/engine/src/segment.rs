@@ -47,8 +47,14 @@ pub enum SegmentError {
     /// The segment id would not be accepted by the manifest (or could escape the namespace's
     /// key prefix). Checked before anything is written.
     InvalidSegmentId(String),
-    /// The object at a manifest-listed segment's key is not the one the manifest recorded
-    /// (different TOC hash): it was replaced, not damaged. Distinct from `Corrupt`.
+    /// The object at a manifest-listed segment's key is a valid segment of the recorded size,
+    /// but not the one the manifest recorded (different TOC hash): it was replaced, not damaged.
+    ///
+    /// Only same-size replacements are told apart this way. An object of a different size fails
+    /// earlier, while reading the footer at the recorded size, and surfaces as `Corrupt` (or a
+    /// store range error), because the bytes at the expected footer position are not a footer.
+    /// One case is not detected at all: a larger object whose first `size` bytes are the
+    /// original segment. That is harmless, because every byte read is the recorded one.
     RefMismatch {
         id: String,
     },

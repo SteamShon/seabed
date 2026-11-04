@@ -131,18 +131,28 @@ impl IndexBinding {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Sha256Hex(pub [u8; 32]);
 
+impl Sha256Hex {
+    /// Canonical lowercase hex. This is the stored form, so it must not change.
+    pub fn to_hex(&self) -> String {
+        const DIGITS: &[u8; 16] = b"0123456789abcdef";
+        let mut s = String::with_capacity(64);
+        for b in self.0 {
+            s.push(DIGITS[(b >> 4) as usize] as char);
+            s.push(DIGITS[(b & 0x0f) as usize] as char);
+        }
+        s
+    }
+}
+
 impl fmt::Debug for Sha256Hex {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for b in self.0 {
-            write!(f, "{b:02x}")?;
-        }
-        Ok(())
+        f.write_str(&self.to_hex())
     }
 }
 
 impl Serialize for Sha256Hex {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&format!("{self:?}"))
+        s.serialize_str(&self.to_hex())
     }
 }
 
