@@ -598,9 +598,20 @@ fn concurrent_commit_content_with_faults_keeps_successor_rules() {
             get_unavailable_ppm: 100_000,
             list_unavailable_ppm: 100_000,
         };
-        let ms = ManifestStore::new(Arc::new(FaultInjecting::new(mem.clone(), cfg)), keys())
+        // One fault injector per writer, all over the same store: the race is real, and each
+        // writer's fault sequence depends only on its own seed (`seed * WRITERS + w`).
+        let store_for = |s: u64| {
+            ManifestStore::new(
+                Arc::new(FaultInjecting::new(
+                    mem.clone(),
+                    FaultConfig { seed: s, ..cfg },
+                )),
+                keys(),
+            )
             .unwrap()
-            .with_retry_policy(RetryPolicy::immediate(64));
+            .with_retry_policy(RetryPolicy::immediate(64))
+        };
+        let ms = store_for(seed * 1000);
         // Even a lone writer can see an injected 409 (`CommitConflict`); the contract is to
         // reload and retry.
         let mut id = 0;
@@ -614,12 +625,17 @@ fn concurrent_commit_content_with_faults_keeps_successor_rules() {
 
         thread::scope(|sc| {
             for w in 0..WRITERS {
-                let ms = &ms;
+                let ms = store_for(seed * WRITERS + w);
                 sc.spawn(move || {
                     let mut done = 0;
                     let mut attempt = 0u64;
                     while done < PER_WRITER {
                         attempt += 1;
+                        // Fail instead of hanging CI if commits stop making progress.
+                        assert!(
+                            attempt < 10_000,
+                            "seed {seed} writer {w}: no progress after {attempt} attempts"
+                        );
                         let (v, prev) = ms.load_latest_content().unwrap().unwrap();
                         let commit_id = (w + 1) * 1_000_000 + attempt;
 
@@ -670,4 +686,48 @@ fn concurrent_commit_content_with_faults_keeps_successor_rules() {
             }
         }
     }
+}
+
+// ---- Added after the pre-merge review of PR #10 ----
+
+#[test]
+fn sha256_hex_stored_form_is_pinned() {
+    // The stored form must never change; a symmetric encode/decode change would still
+    // roundtrip, so pin the exact text.
+    let h = Sha256Hex(std::array::from_fn(|i| i as u8));
+    let expected = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    assert_eq!(h.to_hex(), expected);
+    assert_eq!(
+        serde_json::to_string(&h).unwrap(),
+        format!("\"{expected}\"")
+    );
+}
+
+#[test]
+fn open_ref_with_a_smaller_replacement_is_not_ref_mismatch() {
+    let mem = Arc::new(MemObjectStore::new());
+    let k = keys();
+    let segs = SegmentStore::new(mem.clone()).unwrap();
+    let mut b = SegmentBuilder::new();
+    b.add("vectors", vec![1u8; 64]).unwrap();
+    let recorded = segs.write_segment(&k, "seg-0001", &b).unwrap();
+
+    let mut smaller = SegmentBuilder::new();
+    smaller.add("vectors", vec![9u8; 16]).unwrap();
+    mem.put(
+        &k.segment_key("seg-0001", DATA_FILE),
+        smaller.encode(),
+        PutCondition::Unconditional,
+    )
+    .unwrap();
+
+    // Reading the footer at the recorded (larger) size runs past the end of the object.
+    let err = segs.open_ref(&k, &recorded).err().unwrap();
+    assert!(
+        matches!(
+            err,
+            SegmentError::Corrupt(_) | SegmentError::Store(seabed_ports::StoreError::InvalidRange)
+        ),
+        "a smaller object is caught before the hash check: {err:?}"
+    );
 }

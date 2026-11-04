@@ -264,3 +264,72 @@ fn malformed_pointer_is_reported_as_corrupt() {
     .unwrap();
     assert_eq!(ms.load_latest().unwrap_err(), ManifestError::CorruptPointer);
 }
+
+/// Scripts the one sequence that reaches `create_version`'s "maybe landed" branch:
+/// 1. the first put is applied but its response is lost (`Unavailable`),
+/// 2. the confirming GET fails too, so the outcome is still unknown,
+/// 3. the retried put is rejected because our own first attempt already created the object,
+/// 4. the next confirming GET succeeds and shows the object is ours.
+///
+/// The writer must report success, not a conflict with itself.
+struct LostThenRejected {
+    inner: MemObjectStore,
+    puts: std::sync::atomic::AtomicUsize,
+    gets: std::sync::atomic::AtomicUsize,
+}
+
+impl ObjectStore for LostThenRejected {
+    fn caps(&self) -> ObjectStoreCaps {
+        self.inner.caps()
+    }
+    fn get(&self, key: &Key) -> Result<(Vec<u8>, ETag), StoreError> {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.gets.fetch_add(1, SeqCst) == 0 {
+            return Err(StoreError::Unavailable(
+                "scripted: confirm GET fails".into(),
+            ));
+        }
+        self.inner.get(key)
+    }
+    fn get_range(&self, key: &Key, range: Range<u64>) -> Result<Vec<u8>, StoreError> {
+        self.inner.get_range(key, range)
+    }
+    fn put(&self, key: &Key, data: Vec<u8>, cond: PutCondition) -> Result<ETag, StoreError> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let result = self.inner.put(key, data, cond);
+        if self.puts.fetch_add(1, SeqCst) == 0 {
+            assert!(result.is_ok());
+            return Err(StoreError::Unavailable("scripted: response lost".into()));
+        }
+        result
+    }
+    fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>, StoreError> {
+        self.inner.list(prefix)
+    }
+    fn delete(&self, key: &Key) -> Result<(), StoreError> {
+        self.inner.delete(key)
+    }
+}
+
+#[test]
+fn own_commit_is_recognised_after_lost_response_then_precondition_failed() {
+    let store = Arc::new(LostThenRejected {
+        inner: MemObjectStore::new(),
+        puts: Default::default(),
+        gets: Default::default(),
+    });
+    // No read retries, so the scripted GET failure is seen by `commit` itself.
+    let ms = ManifestStore::new(store.clone(), keys())
+        .unwrap()
+        .with_retry_policy(RetryPolicy::immediate(1));
+
+    assert_eq!(ms.commit(None, 77, b"mine").unwrap(), Version::new(1));
+    let latest = ms.load_latest().unwrap().unwrap();
+    assert_eq!(latest.version, Version::new(1), "no duplicate version");
+    assert_eq!(latest.commit_id, 77);
+    assert_eq!(latest.payload, b"mine");
+    assert!(
+        store.puts.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+        "the retry path was taken"
+    );
+}
