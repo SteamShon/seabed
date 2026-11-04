@@ -1,16 +1,20 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::thread;
 
 use proptest::prelude::*;
 
-use seabed_adapter_objectstore_mem::{CountingObjectStore, MemObjectStore};
+use seabed_adapter_objectstore_mem::{
+    CountingObjectStore, FaultConfig, FaultInjecting, MemObjectStore,
+};
 use seabed_domain::{Lsn, NamespaceId, NamespaceKeys, TenantId};
 use seabed_engine::manifest::{ManifestError, ManifestStore};
 use seabed_engine::manifest_content::{
     ContentError, Distance, IndexBinding, ManifestContent, SegmentRef, Sha256Hex,
 };
 use seabed_engine::segment::{SegmentBuilder, SegmentError, SegmentStore, DATA_FILE};
-use seabed_ports::ObjectStore;
+use seabed_engine::RetryPolicy;
+use seabed_ports::{ObjectStore, PutCondition};
 
 fn keys() -> NamespaceKeys {
     NamespaceKeys::new(
@@ -527,4 +531,143 @@ fn commit_content_after_a_missing_expected_version_is_a_conflict() {
         ManifestError::CommitConflict
     );
     assert_eq!(ms.load_latest().unwrap().unwrap().version.get(), 1);
+}
+
+// ---- Follow-ups deferred from the third pre-merge review of PR #8 ----
+
+#[test]
+fn load_latest_content_rejects_a_foreign_or_invalid_payload_written_raw() {
+    // Raw `commit` skips content validation, so the read path is the only guard here.
+    let ms = ManifestStore::new(Arc::new(MemObjectStore::new()), keys()).unwrap();
+    let v1 = ms
+        .commit(None, 1, &ManifestContent::empty(&other_keys()).encode())
+        .unwrap();
+    assert!(matches!(
+        ms.load_latest_content(),
+        Err(ManifestError::Content(ContentError::WrongNamespace { .. }))
+    ));
+
+    let mut escaping = ManifestContent::empty(&keys());
+    escaping.segments.push(seg_ref("../x")); // bypasses add_segment on purpose
+    ms.commit(Some(v1), 2, &escaping.encode()).unwrap();
+    assert_eq!(
+        ms.load_latest_content().unwrap_err(),
+        ManifestError::Content(ContentError::InvalidSegmentId("../x".into()))
+    );
+}
+
+#[test]
+fn open_ref_with_a_different_size_replacement_is_corrupt_not_ref_mismatch() {
+    let mem = Arc::new(MemObjectStore::new());
+    let k = keys();
+    let segs = SegmentStore::new(mem.clone()).unwrap();
+    let mut b = SegmentBuilder::new();
+    b.add("vectors", vec![1u8; 16]).unwrap();
+    let recorded = segs.write_segment(&k, "seg-0001", &b).unwrap();
+
+    let mut bigger = SegmentBuilder::new();
+    bigger.add("vectors", vec![9u8; 64]).unwrap();
+    mem.put(
+        &k.segment_key("seg-0001", DATA_FILE),
+        bigger.encode(),
+        PutCondition::Unconditional,
+    )
+    .unwrap();
+
+    let err = segs.open_ref(&k, &recorded).err().unwrap();
+    assert!(
+        matches!(err, SegmentError::Corrupt(_)),
+        "a size change is caught by the footer read, not the hash: {err:?}"
+    );
+}
+
+/// Several writers race on `commit_content` while the store drops requests and responses.
+/// Whatever interleaving wins, every committed version must be a legal successor of the one
+/// before it, and every writer's accepted commit must appear exactly once.
+#[test]
+fn concurrent_commit_content_with_faults_keeps_successor_rules() {
+    const WRITERS: u64 = 4;
+    const PER_WRITER: u64 = 5;
+    for seed in 1..=10u64 {
+        let mem = Arc::new(MemObjectStore::new());
+        let cfg = FaultConfig {
+            seed,
+            put_unavailable_ppm: 100_000,
+            put_lose_response_ppm: 150_000,
+            put_conflict_ppm: 50_000,
+            get_unavailable_ppm: 100_000,
+            list_unavailable_ppm: 100_000,
+        };
+        let ms = ManifestStore::new(Arc::new(FaultInjecting::new(mem.clone(), cfg)), keys())
+            .unwrap()
+            .with_retry_policy(RetryPolicy::immediate(64));
+        // Even a lone writer can see an injected 409 (`CommitConflict`); the contract is to
+        // reload and retry.
+        let mut id = 0;
+        while ms.load_latest().unwrap().is_none() {
+            id += 1;
+            match ms.commit_content(None, id, &sample_content()) {
+                Ok(_) | Err(ManifestError::CommitConflict) => {}
+                Err(e) => panic!("seed {seed}: {e:?}"),
+            }
+        }
+
+        thread::scope(|sc| {
+            for w in 0..WRITERS {
+                let ms = &ms;
+                sc.spawn(move || {
+                    let mut done = 0;
+                    let mut attempt = 0u64;
+                    while done < PER_WRITER {
+                        attempt += 1;
+                        let (v, prev) = ms.load_latest_content().unwrap().unwrap();
+                        let commit_id = (w + 1) * 1_000_000 + attempt;
+
+                        // An illegal successor must be refused whatever else is going on.
+                        let mut back = prev.clone();
+                        back.indexed_through = Some(prev.indexed_through.unwrap() - 1);
+                        match ms.commit_content(Some(v), commit_id, &back) {
+                            Err(ManifestError::Content(
+                                ContentError::IndexedThroughRegressed { .. },
+                            )) => {}
+                            other => panic!("regression must be refused, got {other:?}"),
+                        }
+
+                        let mut next = prev;
+                        next.indexed_through = Some(next.indexed_through.unwrap() + 1);
+                        next.add_segment(seg_ref(&format!("w{w}-{done}"))).unwrap();
+                        match ms.commit_content(Some(v), commit_id + 500_000, &next) {
+                            Ok(_) => done += 1,
+                            Err(ManifestError::CommitConflict) => {}
+                            Err(e) => panic!("seed {seed}: unexpected error {e:?}"),
+                        }
+                    }
+                });
+            }
+        });
+
+        // Read the history back through the clean store.
+        let clean = ManifestStore::new(mem, keys()).unwrap();
+        let (latest, _) = clean.load_latest_content().unwrap().unwrap();
+        assert_eq!(latest.get(), 1 + WRITERS * PER_WRITER, "seed {seed}");
+        let mut prev: Option<ManifestContent> = None;
+        for v in 1..=latest.get() {
+            let m = clean.load(seabed_domain::Version::new(v)).unwrap().unwrap();
+            let c = ManifestContent::decode(&m.payload, &keys()).unwrap();
+            if let Some(p) = &prev {
+                p.check_successor(&c)
+                    .unwrap_or_else(|e| panic!("seed {seed}: v{v} breaks rules: {e}"));
+            }
+            prev = Some(c);
+        }
+        let ids: BTreeSet<_> = prev.unwrap().segments.into_iter().map(|s| s.id).collect();
+        for w in 0..WRITERS {
+            for n in 0..PER_WRITER {
+                assert!(
+                    ids.contains(&format!("w{w}-{n}")),
+                    "seed {seed}: w{w}-{n} lost"
+                );
+            }
+        }
+    }
 }
