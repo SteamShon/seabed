@@ -24,9 +24,12 @@
 //! `seabed.sot.parquet_writer` (the real writer version, since `created_by` is fixed). Decoding
 //! requires the first two and checks them.
 //!
-//! Attribute types are inferred per file for now. A namespace-wide attribute schema stored in the
-//! manifest is required before segments are linked into manifests (see PLAN 6.7); without it,
-//! engines reading several files can disagree on a column's type.
+//! Attribute columns follow the namespace-wide schema stored in the manifest (`AttrSchema`):
+//! `encode` writes every schema column (nullable), so files written at the same schema version
+//! have identical columns, and a column never changes type across files. `decode` accepts a file
+//! written with an older, smaller schema (missing columns read as null) but refuses a column the
+//! schema does not have or has with another type. Engines reading several files directly should
+//! still take the file list from the manifest and union columns by name.
 //!
 //! An upsert may have zero vectors (a document with attributes only). `MAX_ID_LEN` counts bytes.
 
@@ -51,7 +54,7 @@ use seabed_ports::{ObjectStore, PutCondition, StoreError};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::manifest_content::{valid_segment_id, Sha256Hex};
+use crate::manifest_content::{valid_segment_id, AttrKind, AttrSchema, Sha256Hex};
 
 /// File name of a segment's documents inside `segments/<id>/`.
 pub const DOCS_FILE: &str = "docs.parquet";
@@ -73,6 +76,12 @@ pub enum SotError {
     InvalidAttrName(String),
     /// The same attribute has values of two different types in one file.
     AttrTypeConflict {
+        name: String,
+    },
+    /// A row has an attribute the namespace schema does not list. Extend the schema first.
+    UnknownAttr(String),
+    /// A file's column does not match the namespace schema (absent from it, or another type).
+    SchemaMismatch {
         name: String,
     },
     /// A vector's length differs from the namespace's dimensions.
@@ -169,48 +178,49 @@ pub fn valid_attr_name(name: &str) -> bool {
         && !RESERVED.contains(&name)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AttrType {
-    Str,
-    I64,
-    F64,
-    Bool,
-}
-
-impl AttrType {
-    fn of(v: &AttrValue) -> Self {
-        match v {
-            AttrValue::Str(_) => AttrType::Str,
-            AttrValue::I64(_) => AttrType::I64,
-            AttrValue::F64(_) => AttrType::F64,
-            AttrValue::Bool(_) => AttrType::Bool,
-        }
-    }
-
-    fn data_type(self) -> DataType {
-        match self {
-            AttrType::Str => DataType::Utf8,
-            AttrType::I64 => DataType::Int64,
-            AttrType::F64 => DataType::Float64,
-            AttrType::Bool => DataType::Boolean,
-        }
-    }
-
-    fn from_data_type(t: &DataType) -> Option<Self> {
-        match t {
-            DataType::Utf8 => Some(AttrType::Str),
-            DataType::Int64 => Some(AttrType::I64),
-            DataType::Float64 => Some(AttrType::F64),
-            DataType::Boolean => Some(AttrType::Bool),
-            _ => None,
-        }
+fn kind_of(v: &AttrValue) -> AttrKind {
+    match v {
+        AttrValue::Str(_) => AttrKind::Str,
+        AttrValue::I64(_) => AttrKind::I64,
+        AttrValue::F64(_) => AttrKind::F64,
+        AttrValue::Bool(_) => AttrKind::Bool,
     }
 }
 
-/// Checks every row and returns the attribute schema. Pure, so rules are testable directly.
-fn validate(rows: &[DocRow], dims: u32) -> Result<BTreeMap<String, AttrType>, SotError> {
+fn data_type(k: AttrKind) -> DataType {
+    match k {
+        AttrKind::Str => DataType::Utf8,
+        AttrKind::I64 => DataType::Int64,
+        AttrKind::F64 => DataType::Float64,
+        AttrKind::Bool => DataType::Boolean,
+    }
+}
+
+/// The attribute types `rows` use, for extending the namespace schema before writing.
+/// Fails if one attribute has values of two types.
+pub fn schema_of(rows: &[DocRow]) -> Result<AttrSchema, SotError> {
+    let mut schema = AttrSchema::new();
+    for r in rows {
+        for (name, value) in &r.attrs {
+            if !valid_attr_name(name) {
+                return Err(SotError::InvalidAttrName(name.clone()));
+            }
+            let k = kind_of(value);
+            if *schema.entry(name.clone()).or_insert(k) != k {
+                return Err(SotError::AttrTypeConflict { name: name.clone() });
+            }
+        }
+    }
+    Ok(schema)
+}
+
+/// Checks every row against the rules and the namespace schema. Pure, so the rules are
+/// testable directly.
+fn validate(rows: &[DocRow], schema: &AttrSchema, dims: u32) -> Result<(), SotError> {
+    if let Some(bad) = schema.keys().find(|n| !valid_attr_name(n)) {
+        return Err(SotError::InvalidAttrName(bad.clone()));
+    }
     let mut ids = BTreeSet::new();
-    let mut schema = BTreeMap::new();
     for r in rows {
         if !valid_doc_id(&r.id) {
             return Err(SotError::InvalidDocId(r.id.clone()));
@@ -243,18 +253,23 @@ fn validate(rows: &[DocRow], dims: u32) -> Result<BTreeMap<String, AttrType>, So
             if matches!(value, AttrValue::F64(x) if !x.is_finite()) {
                 return Err(SotError::NonFinite { id: r.id.clone() });
             }
-            let t = AttrType::of(value);
-            if *schema.entry(name.clone()).or_insert(t) != t {
-                return Err(SotError::AttrTypeConflict { name: name.clone() });
+            match schema.get(name) {
+                None => return Err(SotError::UnknownAttr(name.clone())),
+                Some(k) if *k != kind_of(value) => {
+                    return Err(SotError::AttrTypeConflict { name: name.clone() })
+                }
+                Some(_) => {}
             }
         }
     }
-    Ok(schema)
+    Ok(())
 }
 
-/// Encodes rows as a SoT Parquet file. Rows may be given in any order.
-pub fn encode(rows: &[DocRow], dims: u32) -> Result<Vec<u8>, SotError> {
-    let attr_schema = validate(rows, dims)?;
+/// Encodes rows as a SoT Parquet file with one column per `schema` attribute. Rows may be
+/// given in any order.
+pub fn encode(rows: &[DocRow], schema: &AttrSchema, dims: u32) -> Result<Vec<u8>, SotError> {
+    validate(rows, schema, dims)?;
+    let attr_schema = schema;
     let mut sorted: Vec<&DocRow> = rows.iter().collect();
     sorted.sort_by(|a, b| a.id.cmp(&b.id));
 
@@ -288,9 +303,9 @@ pub fn encode(rows: &[DocRow], dims: u32) -> Result<Vec<u8>, SotError> {
         Field::new("vectors", vectors.data_type().clone(), false),
     ];
     let mut columns = vec![ids, lsns, deleted, vectors];
-    for (name, t) in &attr_schema {
+    for (name, t) in attr_schema {
         let col: ArrayRef = match t {
-            AttrType::Str => Arc::new(StringArray::from(
+            AttrKind::Str => Arc::new(StringArray::from(
                 sorted
                     .iter()
                     .map(|r| match r.attrs.get(name) {
@@ -299,7 +314,7 @@ pub fn encode(rows: &[DocRow], dims: u32) -> Result<Vec<u8>, SotError> {
                     })
                     .collect::<Vec<_>>(),
             )),
-            AttrType::I64 => Arc::new(Int64Array::from(
+            AttrKind::I64 => Arc::new(Int64Array::from(
                 sorted
                     .iter()
                     .map(|r| match r.attrs.get(name) {
@@ -308,7 +323,7 @@ pub fn encode(rows: &[DocRow], dims: u32) -> Result<Vec<u8>, SotError> {
                     })
                     .collect::<Vec<_>>(),
             )),
-            AttrType::F64 => Arc::new(Float64Array::from(
+            AttrKind::F64 => Arc::new(Float64Array::from(
                 sorted
                     .iter()
                     .map(|r| match r.attrs.get(name) {
@@ -317,7 +332,7 @@ pub fn encode(rows: &[DocRow], dims: u32) -> Result<Vec<u8>, SotError> {
                     })
                     .collect::<Vec<_>>(),
             )),
-            AttrType::Bool => Arc::new(BooleanArray::from(
+            AttrKind::Bool => Arc::new(BooleanArray::from(
                 sorted
                     .iter()
                     .map(|r| match r.attrs.get(name) {
@@ -327,7 +342,7 @@ pub fn encode(rows: &[DocRow], dims: u32) -> Result<Vec<u8>, SotError> {
                     .collect::<Vec<_>>(),
             )),
         };
-        fields.push(Field::new(name, t.data_type(), true));
+        fields.push(Field::new(name, data_type(*t), true));
         columns.push(col);
     }
 
@@ -351,12 +366,19 @@ pub fn encode(rows: &[DocRow], dims: u32) -> Result<Vec<u8>, SotError> {
 }
 
 /// Decodes and validates a SoT Parquet file. Returns rows sorted by id.
-pub fn decode(bytes: &[u8], dims: u32) -> Result<Vec<DocRow>, SotError> {
-    decode_bytes(bytes::Bytes::copy_from_slice(bytes), dims)
+///
+/// `schema` is the namespace's current schema. The file may lack columns added to the schema
+/// after it was written; those read as absent attributes.
+pub fn decode(bytes: &[u8], schema: &AttrSchema, dims: u32) -> Result<Vec<DocRow>, SotError> {
+    decode_bytes(bytes::Bytes::copy_from_slice(bytes), schema, dims)
 }
 
 /// Like `decode`, but takes ownership so the store's buffer is not copied again.
-fn decode_bytes(bytes: bytes::Bytes, dims: u32) -> Result<Vec<DocRow>, SotError> {
+fn decode_bytes(
+    bytes: bytes::Bytes,
+    schema: &AttrSchema,
+    dims: u32,
+) -> Result<Vec<DocRow>, SotError> {
     let builder = ParquetRecordBatchReaderBuilder::try_new(bytes).map_err(format_err)?;
     check_file_metadata(
         builder.metadata().file_metadata().key_value_metadata(),
@@ -366,14 +388,14 @@ fn decode_bytes(bytes: bytes::Bytes, dims: u32) -> Result<Vec<DocRow>, SotError>
     let mut rows = Vec::new();
     for batch in reader {
         let batch = batch.map_err(format_err)?;
-        decode_batch(&batch, dims, &mut rows)?;
+        decode_batch(&batch, schema, dims, &mut rows)?;
     }
     for pair in rows.windows(2) {
         if pair[0].id >= pair[1].id {
             return Err(SotError::Format("rows are not sorted by unique id".into()));
         }
     }
-    validate(&rows, dims)?;
+    validate(&rows, schema, dims)?;
     Ok(rows)
 }
 
@@ -418,7 +440,12 @@ fn column<'a>(
     Ok(col)
 }
 
-fn decode_batch(batch: &RecordBatch, dims: u32, out: &mut Vec<DocRow>) -> Result<(), SotError> {
+fn decode_batch(
+    batch: &RecordBatch,
+    schema: &AttrSchema,
+    dims: u32,
+    out: &mut Vec<DocRow>,
+) -> Result<(), SotError> {
     let ids = column(batch, "id", &DataType::Utf8)?.as_string::<i32>();
     let lsns = column(batch, "lsn", &DataType::Int64)?.as_primitive::<Int64Type>();
     let deleted = column(batch, "deleted", &DataType::Boolean)?.as_boolean();
@@ -441,7 +468,7 @@ fn decode_batch(batch: &RecordBatch, dims: u32, out: &mut Vec<DocRow>) -> Result
         return Err(SotError::Format("null inside column vectors".into()));
     }
 
-    let mut attrs: Vec<(String, AttrType, &ArrayRef)> = Vec::new();
+    let mut attrs: Vec<(String, AttrKind, &ArrayRef)> = Vec::new();
     for (field, col) in batch.schema().fields().iter().zip(batch.columns()) {
         let name = field.name();
         if RESERVED.contains(&name.as_str()) {
@@ -450,9 +477,13 @@ fn decode_batch(batch: &RecordBatch, dims: u32, out: &mut Vec<DocRow>) -> Result
         if !valid_attr_name(name) {
             return Err(SotError::InvalidAttrName(name.clone()));
         }
-        let t = AttrType::from_data_type(col.data_type())
-            .ok_or_else(|| SotError::Format(format!("attribute {name} has unsupported type")))?;
-        attrs.push((name.clone(), t, col));
+        // Checked per column so an all-null column is caught too: row-level validation never
+        // sees attributes whose values are all null.
+        let kind = match schema.get(name) {
+            Some(k) if data_type(*k) == *col.data_type() => *k,
+            _ => return Err(SotError::SchemaMismatch { name: name.clone() }),
+        };
+        attrs.push((name.clone(), kind, col));
     }
 
     for i in 0..batch.num_rows() {
@@ -470,10 +501,10 @@ fn decode_batch(batch: &RecordBatch, dims: u32, out: &mut Vec<DocRow>) -> Result
                 continue;
             }
             let value = match t {
-                AttrType::Str => AttrValue::Str(col.as_string::<i32>().value(i).to_string()),
-                AttrType::I64 => AttrValue::I64(col.as_primitive::<Int64Type>().value(i)),
-                AttrType::F64 => AttrValue::F64(col.as_primitive::<Float64Type>().value(i)),
-                AttrType::Bool => AttrValue::Bool(col.as_boolean().value(i)),
+                AttrKind::Str => AttrValue::Str(col.as_string::<i32>().value(i).to_string()),
+                AttrKind::I64 => AttrValue::I64(col.as_primitive::<Int64Type>().value(i)),
+                AttrKind::F64 => AttrValue::F64(col.as_primitive::<Float64Type>().value(i)),
+                AttrKind::Bool => AttrValue::Bool(col.as_boolean().value(i)),
             };
             row_attrs.insert(name.clone(), value);
         }
@@ -534,10 +565,11 @@ impl<S: ObjectStore> SotStore<S> {
         keys: &NamespaceKeys,
         segment_id: &str,
         rows: &[DocRow],
+        schema: &AttrSchema,
         dims: u32,
     ) -> Result<SotRef, SotError> {
         let key = Self::key(keys, segment_id)?;
-        let bytes = encode(rows, dims)?;
+        let bytes = encode(rows, schema, dims)?;
         let r = SotRef {
             size: bytes.len() as u64,
             sha256: Sha256Hex(sha256(&bytes)),
@@ -555,6 +587,7 @@ impl<S: ObjectStore> SotStore<S> {
         keys: &NamespaceKeys,
         segment_id: &str,
         recorded: &SotRef,
+        schema: &AttrSchema,
         dims: u32,
     ) -> Result<Vec<DocRow>, SotError> {
         let key = Self::key(keys, segment_id)?;
@@ -562,6 +595,6 @@ impl<S: ObjectStore> SotStore<S> {
         if bytes.len() as u64 != recorded.size || sha256(&bytes) != recorded.sha256.0 {
             return Err(SotError::RefMismatch);
         }
-        decode_bytes(bytes::Bytes::from(bytes), dims)
+        decode_bytes(bytes::Bytes::from(bytes), schema, dims)
     }
 }

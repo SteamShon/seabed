@@ -10,9 +10,11 @@ use seabed_adapter_objectstore_mem::{
 use seabed_domain::{Lsn, NamespaceId, NamespaceKeys, TenantId};
 use seabed_engine::manifest::{ManifestError, ManifestStore};
 use seabed_engine::manifest_content::{
-    ContentError, Distance, IndexBinding, ManifestContent, SegmentRef, Sha256Hex,
+    AttrKind, AttrSchema, ContentError, Distance, IndexBinding, IndexRef, ManifestContent,
+    SegmentRef, Sha256Hex,
 };
 use seabed_engine::segment::{SegmentBuilder, SegmentError, SegmentStore, DATA_FILE};
+use seabed_engine::sot::{schema_of, AttrValue, DocRow, SotError, SotRef, SotStore};
 use seabed_engine::RetryPolicy;
 use seabed_ports::{ObjectStore, PutCondition};
 
@@ -44,8 +46,14 @@ fn binding() -> IndexBinding {
 fn seg_ref(id: &str) -> SegmentRef {
     SegmentRef {
         id: id.into(),
-        size: 100,
-        toc_sha256: Sha256Hex([0xab; 32]),
+        docs: SotRef {
+            size: 100,
+            sha256: Sha256Hex([0xcd; 32]),
+        },
+        index: Some(IndexRef {
+            size: 100,
+            toc_sha256: Sha256Hex([0xab; 32]),
+        }),
     }
 }
 
@@ -177,7 +185,14 @@ fn segments_written_then_committed_can_be_read_back_from_the_latest_manifest() {
     // First flush: one segment covering WAL up to LSN 10.
     let mut b1 = SegmentBuilder::new();
     b1.add("vectors", vec![1u8; 64]).unwrap();
-    let r1 = segs.write_segment(&k, "seg-0001", &b1).unwrap();
+    let sots = SotStore::new(mem.clone());
+    let r1 = SegmentRef {
+        id: "seg-0001".into(),
+        docs: sots
+            .write(&k, "seg-0001", &[], &AttrSchema::new(), 768)
+            .unwrap(),
+        index: Some(segs.write_segment(&k, "seg-0001", &b1).unwrap()),
+    };
     let mut c = ManifestContent::empty(&k);
     c.bind(binding()).unwrap();
     c.add_segment(r1).unwrap();
@@ -190,8 +205,14 @@ fn segments_written_then_committed_can_be_read_back_from_the_latest_manifest() {
     c.check_binding(&binding()).unwrap();
     let mut b2 = SegmentBuilder::new();
     b2.add("vectors", vec![2u8; 32]).unwrap();
-    c.add_segment(segs.write_segment(&k, "seg-0002", &b2).unwrap())
-        .unwrap();
+    c.add_segment(SegmentRef {
+        id: "seg-0002".into(),
+        docs: sots
+            .write(&k, "seg-0002", &[], &AttrSchema::new(), 768)
+            .unwrap(),
+        index: Some(segs.write_segment(&k, "seg-0002", &b2).unwrap()),
+    })
+    .unwrap();
     c.indexed_through = Some(25);
     ms.commit_content(Some(v1), 2, &c).unwrap();
 
@@ -201,7 +222,14 @@ fn segments_written_then_committed_can_be_read_back_from_the_latest_manifest() {
     assert_eq!(ids, ["seg-0001", "seg-0002"]);
     let expected = [vec![1u8; 64], vec![2u8; 32]];
     for (s, want) in latest.segments.iter().zip(expected) {
-        assert_eq!(segs.open_ref(&k, s).unwrap().read("vectors").unwrap(), want);
+        let index = s.index.as_ref().unwrap();
+        assert_eq!(
+            segs.open_ref(&k, &s.id, index)
+                .unwrap()
+                .read("vectors")
+                .unwrap(),
+            want
+        );
     }
 }
 
@@ -221,7 +249,7 @@ fn open_ref_detects_a_different_object_at_the_recorded_key() {
     segs.write_segment(&k, "seg-0001", &other).unwrap();
 
     assert_eq!(
-        segs.open_ref(&k, &recorded).err(),
+        segs.open_ref(&k, "seg-0001", &recorded).err(),
         Some(SegmentError::RefMismatch {
             id: "seg-0001".into()
         })
@@ -435,8 +463,14 @@ fn arb_content() -> impl Strategy<Value = ManifestContent> {
                 for (id, (size, sha)) in ids.into_iter().zip(extra) {
                     c.add_segment(SegmentRef {
                         id,
-                        size,
-                        toc_sha256: Sha256Hex(sha),
+                        docs: SotRef {
+                            size,
+                            sha256: Sha256Hex(sha),
+                        },
+                        index: (size % 2 == 0).then_some(IndexRef {
+                            size,
+                            toc_sha256: Sha256Hex(sha),
+                        }),
                     })
                     .unwrap();
                 }
@@ -574,7 +608,7 @@ fn open_ref_with_a_different_size_replacement_is_corrupt_not_ref_mismatch() {
     )
     .unwrap();
 
-    let err = segs.open_ref(&k, &recorded).err().unwrap();
+    let err = segs.open_ref(&k, "seg-0001", &recorded).err().unwrap();
     assert!(
         matches!(err, SegmentError::Corrupt(_)),
         "a size change is caught by the footer read, not the hash: {err:?}"
@@ -722,7 +756,7 @@ fn open_ref_with_a_smaller_replacement_is_not_ref_mismatch() {
     .unwrap();
 
     // Reading the footer at the recorded (larger) size runs past the end of the object.
-    let err = segs.open_ref(&k, &recorded).err().unwrap();
+    let err = segs.open_ref(&k, "seg-0001", &recorded).err().unwrap();
     assert!(
         matches!(
             err,
@@ -751,6 +785,269 @@ fn open_ref_accepts_a_replacement_that_keeps_the_original_bytes_as_a_prefix() {
     )
     .unwrap();
 
-    let r = segs.open_ref(&k, &recorded).unwrap();
+    let r = segs.open_ref(&k, "seg-0001", &recorded).unwrap();
     assert_eq!(r.read("vectors").unwrap(), vec![1u8; 16]);
+}
+
+// ---- Namespace attribute schema ----
+
+fn schema(pairs: &[(&str, AttrKind)]) -> AttrSchema {
+    pairs.iter().map(|(n, k)| (n.to_string(), *k)).collect()
+}
+
+#[test]
+fn attr_schema_only_grows_between_versions() {
+    let mut prev = ManifestContent::empty(&keys());
+    prev.extend_attr_schema(&schema(&[("price", AttrKind::I64)]))
+        .unwrap();
+
+    let mut grown = prev.clone();
+    grown
+        .extend_attr_schema(&schema(&[("color", AttrKind::Str)]))
+        .unwrap();
+    prev.check_successor(&grown).unwrap();
+
+    let mut retyped = prev.clone();
+    retyped.attr_schema.insert("price".into(), AttrKind::F64); // bypasses extend on purpose
+    assert_eq!(
+        prev.check_successor(&retyped).unwrap_err(),
+        ContentError::AttrSchemaChanged {
+            name: "price".into(),
+            before: AttrKind::I64,
+            after: Some(AttrKind::F64)
+        }
+    );
+
+    let mut dropped = prev.clone();
+    dropped.attr_schema.clear();
+    assert_eq!(
+        prev.check_successor(&dropped).unwrap_err(),
+        ContentError::AttrSchemaChanged {
+            name: "price".into(),
+            before: AttrKind::I64,
+            after: None
+        }
+    );
+}
+
+#[test]
+fn extend_attr_schema_is_all_or_nothing() {
+    let mut c = ManifestContent::empty(&keys());
+    c.extend_attr_schema(&schema(&[("price", AttrKind::I64)]))
+        .unwrap();
+    let before = c.attr_schema.clone();
+    // One good addition and one conflicting: neither is applied.
+    assert!(matches!(
+        c.extend_attr_schema(&schema(&[
+            ("color", AttrKind::Str),
+            ("price", AttrKind::F64)
+        ])),
+        Err(ContentError::AttrSchemaChanged { .. })
+    ));
+    assert_eq!(c.attr_schema, before);
+    assert_eq!(
+        c.extend_attr_schema(&schema(&[("Bad", AttrKind::Str)]))
+            .unwrap_err(),
+        ContentError::InvalidAttrName("Bad".into())
+    );
+    assert_eq!(c.attr_schema, before);
+}
+
+#[test]
+fn decode_rejects_an_invalid_attribute_name_in_the_schema() {
+    let mut c = ManifestContent::empty(&keys());
+    c.attr_schema.insert("lsn".into(), AttrKind::I64); // reserved column name
+    assert_eq!(
+        ManifestContent::decode(&c.encode(), &keys()).unwrap_err(),
+        ContentError::InvalidAttrName("lsn".into())
+    );
+}
+
+#[test]
+fn commit_content_refuses_an_attribute_type_change() {
+    let ms = ManifestStore::new(Arc::new(MemObjectStore::new()), keys()).unwrap();
+    let mut c = ManifestContent::empty(&keys());
+    c.extend_attr_schema(&schema(&[("price", AttrKind::I64)]))
+        .unwrap();
+    let v1 = ms.commit_content(None, 1, &c).unwrap();
+    c.attr_schema.insert("price".into(), AttrKind::Str);
+    assert!(matches!(
+        ms.commit_content(Some(v1), 2, &c),
+        Err(ManifestError::Content(
+            ContentError::AttrSchemaChanged { .. }
+        ))
+    ));
+    assert_eq!(
+        ms.load_latest().unwrap().unwrap().version,
+        v1,
+        "nothing written"
+    );
+}
+
+/// What a flush does: extend the namespace schema with the rows' attributes, write the SoT
+/// with that schema, then commit a manifest listing the segment.
+fn flush(
+    ms: &ManifestStore<MemObjectStore>,
+    sots: &SotStore<MemObjectStore>,
+    id: &str,
+    rows: &[DocRow],
+    through: u64,
+) -> Result<(), ContentError> {
+    let latest = ms.load_latest_content().unwrap();
+    let (expected, mut c) = match latest {
+        Some((v, c)) => (Some(v), c),
+        None => (None, ManifestContent::empty(&keys())),
+    };
+    // Schema first: a conflicting type is refused before any object is written.
+    c.extend_attr_schema(&schema_of(rows).unwrap())?;
+    let docs = sots.write(&keys(), id, rows, &c.attr_schema, 3).unwrap();
+    c.add_segment(SegmentRef {
+        id: id.into(),
+        docs,
+        index: None,
+    })?;
+    c.indexed_through = Some(through);
+    ms.commit_content(expected, through, &c).unwrap();
+    Ok(())
+}
+
+#[test]
+fn flushes_with_a_growing_schema_read_back_consistently_and_type_changes_are_refused() {
+    let mem = Arc::new(MemObjectStore::new());
+    let ms = ManifestStore::new(mem.clone(), keys()).unwrap();
+    let sots = SotStore::new(mem.clone());
+
+    let first = vec![DocRow::upsert("a", 1, vec![]).with_attr("price", AttrValue::I64(10))];
+    flush(&ms, &sots, "seg-0001", &first, 1).unwrap();
+    let second = vec![DocRow::upsert("b", 2, vec![])
+        .with_attr("price", AttrValue::I64(20))
+        .with_attr("color", AttrValue::Str("red".into()))];
+    flush(&ms, &sots, "seg-0002", &second, 2).unwrap();
+
+    // `price` as a float would silently corrupt readers of older files: refused, nothing written.
+    let objects_before = mem.list("").unwrap().len();
+    let retyped = vec![DocRow::upsert("c", 3, vec![]).with_attr("price", AttrValue::F64(1.5))];
+    assert!(matches!(
+        flush(&ms, &sots, "seg-0003", &retyped, 3),
+        Err(ContentError::AttrSchemaChanged { .. })
+    ));
+    assert_eq!(
+        mem.list("").unwrap().len(),
+        objects_before,
+        "no SoT file written"
+    );
+
+    // Read every segment the latest manifest lists, with the manifest's schema.
+    let (_, latest) = ms.load_latest_content().unwrap().unwrap();
+    assert_eq!(
+        latest.attr_schema,
+        schema(&[("color", AttrKind::Str), ("price", AttrKind::I64)])
+    );
+    let mut all = Vec::new();
+    for s in &latest.segments {
+        all.extend(
+            sots.read(&keys(), &s.id, &s.docs, &latest.attr_schema, 3)
+                .unwrap(),
+        );
+    }
+    assert_eq!(all.len(), 2);
+    assert_eq!(all[0].attrs.get("price"), Some(&AttrValue::I64(10)));
+    assert_eq!(
+        all[0].attrs.get("color"),
+        None,
+        "older file lacks the newer column"
+    );
+    assert_eq!(
+        all[1].attrs.get("color"),
+        Some(&AttrValue::Str("red".into()))
+    );
+
+    // A row whose attribute is not in the schema cannot be written by mistake.
+    let unknown = [DocRow::upsert("d", 4, vec![]).with_attr("size", AttrValue::I64(1))];
+    assert_eq!(
+        sots.write(&keys(), "seg-0009", &unknown, &latest.attr_schema, 3)
+            .unwrap_err(),
+        SotError::UnknownAttr("size".into())
+    );
+}
+
+// ---- Added after PR #13 round-1 review ----
+
+#[test]
+fn decode_reports_a_v1_manifest_as_unsupported_version() {
+    // The exact v1 layout: segments carried size/toc_sha256 directly and there was no
+    // attr_schema. It must read as "other version", not as a damaged manifest.
+    let v1 = format!(
+        r#"{{"format_version":1,"tenant":"acme","namespace":"ads","indexed_through":null,"index_binding":null,"segments":[{{"id":"seg-0001","size":100,"toc_sha256":"{}"}}]}}"#,
+        "ab".repeat(32)
+    );
+    assert_eq!(
+        ManifestContent::decode(v1.as_bytes(), &keys()).unwrap_err(),
+        ContentError::UnsupportedVersion(1)
+    );
+}
+
+#[test]
+fn open_ref_rejects_an_invalid_segment_id() {
+    let segs = SegmentStore::new(Arc::new(MemObjectStore::new())).unwrap();
+    let index = IndexRef {
+        size: 100,
+        toc_sha256: Sha256Hex([0; 32]),
+    };
+    assert_eq!(
+        segs.open_ref(&keys(), "../x", &index).err(),
+        Some(SegmentError::InvalidSegmentId("../x".into()))
+    );
+}
+
+/// Two writers start from the same manifest and widen the schema with conflicting types.
+/// Exactly one commits; the loser sees the conflict on reload; its already-written SoT file
+/// stays behind as an orphan the manifest never lists (GC's job, documented in PLAN 6.7).
+#[test]
+fn racing_flushes_with_conflicting_attr_types_commit_only_one() {
+    let mem = Arc::new(MemObjectStore::new());
+    let ms = ManifestStore::new(mem.clone(), keys()).unwrap();
+    let sots = SotStore::new(mem.clone());
+    let v1 = ms
+        .commit_content(None, 1, &ManifestContent::empty(&keys()))
+        .unwrap();
+
+    let (_, base) = ms.load_latest_content().unwrap().unwrap();
+    let writer = |id: &str, value: AttrValue, commit_id: u64| {
+        let rows = vec![DocRow::upsert(id, commit_id, vec![]).with_attr("price", value)];
+        let mut c = base.clone();
+        c.extend_attr_schema(&schema_of(&rows).unwrap()).unwrap();
+        let docs = sots.write(&keys(), id, &rows, &c.attr_schema, 3).unwrap();
+        c.add_segment(SegmentRef {
+            id: id.into(),
+            docs,
+            index: None,
+        })
+        .unwrap();
+        ms.commit_content(Some(v1), commit_id, &c)
+    };
+    writer("seg-a", AttrValue::I64(1), 10).unwrap();
+    assert_eq!(
+        writer("seg-b", AttrValue::F64(1.5), 11).unwrap_err(),
+        ManifestError::CommitConflict
+    );
+
+    // The loser reloads and now sees the schema conflict.
+    let (_, latest) = ms.load_latest_content().unwrap().unwrap();
+    let mut retry = latest.clone();
+    assert!(matches!(
+        retry.extend_attr_schema(&schema(&[("price", AttrKind::F64)])),
+        Err(ContentError::AttrSchemaChanged { .. })
+    ));
+
+    // Only the winner is listed, and everything listed reads with the manifest schema.
+    let ids: Vec<_> = latest.segments.iter().map(|s| s.id.as_str()).collect();
+    assert_eq!(ids, ["seg-a"]);
+    for s in &latest.segments {
+        sots.read(&keys(), &s.id, &s.docs, &latest.attr_schema, 3)
+            .unwrap();
+    }
+    // The loser's file exists but is unreferenced.
+    let orphans: Vec<_> = mem.list(keys().segment_key("seg-b", "").as_str()).unwrap();
+    assert_eq!(orphans.len(), 1, "one orphan SoT file, for GC");
 }
