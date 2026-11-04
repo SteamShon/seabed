@@ -208,8 +208,10 @@ impl<S: ObjectStore> ManifestStore<S> {
     }
 
     /// Commits `payload` as the version after `expected` (`None` means "no manifest exists yet").
-    /// `commit_id` must be unique per commit attempt; it lets the writer recognise its own commit
-    /// after an ambiguous failure.
+    /// Commits with different payloads must never share a `commit_id`; it lets the writer
+    /// recognise its own commit after an ambiguous failure. Commits with identical payloads may
+    /// share one (for example an id derived from the payload): adopting the other's object is
+    /// harmless because it holds the same content.
     ///
     /// The commit point is the creation of the version object. Advancing the pointer afterwards
     /// is best effort: if it fails, the commit still stands and readers find the version by

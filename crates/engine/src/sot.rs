@@ -22,7 +22,10 @@
 //!
 //! File key-value metadata carries `seabed.sot.format_version`, `seabed.sot.dims` and
 //! `seabed.sot.parquet_writer` (the real writer version, since `created_by` is fixed). Decoding
-//! requires the first two and checks them.
+//! requires the first two and checks them. Any change to what `encode` writes for the same rows
+//! and schema must bump `SOT_FORMAT_VERSION`: flush derives segment ids from it (see
+//! `namespace`), and an unchanged id with different bytes would make a re-flush fail with
+//! `AlreadyExists`.
 //!
 //! Attribute columns follow the namespace-wide schema stored in the manifest (`AttrSchema`):
 //! `encode` writes every schema column (nullable), so files written at the same schema version
@@ -61,6 +64,8 @@ pub const DOCS_FILE: &str = "docs.parquet";
 pub const MAX_ID_LEN: usize = 256;
 pub const MAX_ATTR_NAME_LEN: usize = 64;
 pub const SOT_FORMAT_VERSION: u32 = 1;
+/// Attempts for one create-only SoT write before giving up on an unclear outcome.
+const MAX_PUT_ATTEMPTS: usize = 32;
 const KEY_VERSION: &str = "seabed.sot.format_version";
 const KEY_DIMS: &str = "seabed.sot.dims";
 const KEY_WRITER: &str = "seabed.sot.parquet_writer";
@@ -118,7 +123,8 @@ fn format_err(e: impl std::fmt::Display) -> SotError {
     SotError::Format(e.to_string())
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AttrValue {
     Str(String),
     I64(i64),
@@ -212,6 +218,12 @@ pub fn schema_of(rows: &[DocRow]) -> Result<AttrSchema, SotError> {
         }
     }
     Ok(schema)
+}
+
+/// Checks rows against the SoT rules and `schema` without encoding them, so writers can refuse
+/// bad input before it reaches the WAL.
+pub fn validate_rows(rows: &[DocRow], schema: &AttrSchema, dims: u32) -> Result<(), SotError> {
+    validate(rows, schema, dims)
 }
 
 /// Checks every row against the rules and the namespace schema. Pure, so the rules are
@@ -534,8 +546,8 @@ fn sha256(data: &[u8]) -> [u8; 32] {
     Sha256::digest(data).into()
 }
 
-/// Writes and reads SoT files. Reads are retried like the other stores; the create-only write
-/// is not.
+/// Writes and reads SoT files. Reads are retried like the other stores. Writes are create-only:
+/// `write` retries an unclear put itself and accepts the key only if it holds the same bytes.
 pub struct SotStore<S: ObjectStore> {
     store: Retrying<Arc<S>>,
 }
@@ -559,7 +571,9 @@ impl<S: ObjectStore> SotStore<S> {
         Ok(keys.segment_key(segment_id, DOCS_FILE))
     }
 
-    /// Encodes `rows` and creates the segment's SoT file. Never overwrites.
+    /// Encodes `rows` and creates the segment's SoT file. Never overwrites: if the key already
+    /// holds exactly these bytes the write succeeds (idempotent retry), otherwise
+    /// `AlreadyExists`.
     pub fn write(
         &self,
         keys: &NamespaceKeys,
@@ -574,11 +588,31 @@ impl<S: ObjectStore> SotStore<S> {
             size: bytes.len() as u64,
             sha256: Sha256Hex(sha256(&bytes)),
         };
-        match self.store.put(&key, bytes, PutCondition::IfNoneMatch) {
-            Ok(_) => Ok(r),
-            Err(StoreError::PreconditionFailed) => Err(SotError::AlreadyExists),
-            Err(e) => Err(e.into()),
+        // Encoding is deterministic, so a retried write (after a lost response) or a racing
+        // write of the same WAL range produces the same bytes. Whenever the outcome is unclear
+        // or the key is taken, look at what is there: the same bytes count as success, other
+        // bytes are a real conflict, nothing yet means try again.
+        for _ in 0..MAX_PUT_ATTEMPTS {
+            let outcome = self
+                .store
+                .put(&key, bytes.clone(), PutCondition::IfNoneMatch);
+            let retry_put = match outcome {
+                Ok(_) => return Ok(r),
+                Err(StoreError::PreconditionFailed)
+                | Err(StoreError::Conflict)
+                | Err(StoreError::Unavailable(_)) => match self.store.get(&key) {
+                    Ok((existing, _)) if sha256(&existing) == r.sha256.0 => return Ok(r),
+                    Ok(_) => return Err(SotError::AlreadyExists),
+                    Err(StoreError::NotFound) | Err(StoreError::Unavailable(_)) => true,
+                    Err(e) => return Err(e.into()),
+                },
+                Err(e) => return Err(e.into()),
+            };
+            debug_assert!(retry_put);
         }
+        Err(SotError::Store(StoreError::Unavailable(
+            "SoT write: too many attempts".into(),
+        )))
     }
 
     /// Reads the whole file, checks it is the recorded one, and decodes it.

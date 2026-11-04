@@ -222,12 +222,31 @@ fn store_write_then_read_checks_size_and_hash() {
     // The object lives at segments/<id>/docs.parquet.
     assert!(mem.get(&k.segment_key("seg-0001", DOCS_FILE)).is_ok());
 
-    // Never overwritten.
+    // Never overwritten. Writing the very same rows again is an idempotent retry and returns
+    // the same reference; different content at that key is refused and the object is unchanged.
     assert_eq!(
         store
             .write(&k, "seg-0001", &sample(), &test_schema(), DIMS)
+            .unwrap(),
+        r
+    );
+    assert_eq!(
+        store
+            .write(
+                &k,
+                "seg-0001",
+                &[DocRow::upsert("other", 1, vec![])],
+                &test_schema(),
+                DIMS
+            )
             .unwrap_err(),
         SotError::AlreadyExists
+    );
+    assert_eq!(
+        store
+            .read(&k, "seg-0001", &r, &test_schema(), DIMS)
+            .unwrap(),
+        sorted(sample())
     );
 
     // A record that does not match the object is refused before decoding.
