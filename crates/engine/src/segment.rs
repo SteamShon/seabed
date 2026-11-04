@@ -26,7 +26,7 @@ use seabed_domain::{Key, NamespaceKeys};
 use seabed_ports::{ObjectStore, PutCondition, StoreError};
 use sha2::{Digest, Sha256};
 
-use crate::manifest_content::{SegmentRef, Sha256Hex};
+use crate::manifest_content::{valid_segment_id, SegmentRef, Sha256Hex};
 
 pub const FORMAT_VERSION: u16 = 1;
 pub const MAGIC: [u8; 4] = *b"SBSG";
@@ -44,6 +44,9 @@ pub enum SegmentError {
     /// A segment already exists at this key. Segments are immutable.
     AlreadyExists,
     InvalidName(String),
+    /// The segment id would not be accepted by the manifest (or could escape the namespace's
+    /// key prefix). Checked before anything is written.
+    InvalidSegmentId(String),
     DuplicateSection(String),
     MissingSection(String),
     UnsupportedVersion(u16),
@@ -224,6 +227,9 @@ impl<S: ObjectStore> SegmentStore<S> {
         id: &str,
         segment: &SegmentBuilder,
     ) -> Result<SegmentRef, SegmentError> {
+        if !valid_segment_id(id) {
+            return Err(SegmentError::InvalidSegmentId(id.to_string()));
+        }
         let w = self.write(&keys.segment_key(id, DATA_FILE), segment)?;
         Ok(SegmentRef {
             id: id.to_string(),

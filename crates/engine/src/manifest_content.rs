@@ -24,6 +24,11 @@ pub enum ContentError {
         manifest: String,
         expected: String,
     },
+    /// A new version would move `indexed_through` backwards (or drop it). LSNs only grow.
+    IndexedThroughRegressed {
+        previous: u64,
+        next: Option<u64>,
+    },
     /// The requested binding differs from the one the indexes were built with.
     BindingMismatch {
         field: &'static str,
@@ -42,6 +47,10 @@ impl fmt::Display for ContentError {
             ContentError::WrongNamespace { manifest, expected } => {
                 write!(f, "manifest belongs to {manifest}, expected {expected}")
             }
+            ContentError::IndexedThroughRegressed { previous, next } => write!(
+                f,
+                "indexed_through would go from {previous} back to {next:?}"
+            ),
             ContentError::BindingMismatch {
                 field,
                 manifest,
@@ -139,10 +148,24 @@ impl<'de> Deserialize<'de> for Sha256Hex {
         if bytes.len() != 64 {
             return Err(serde::de::Error::custom("sha256 must be 64 hex characters"));
         }
+        // Only canonical lowercase hex, so decode then encode gives back the same bytes.
+        fn nibble(c: u8) -> Option<u8> {
+            match c {
+                b'0'..=b'9' => Some(c - b'0'),
+                b'a'..=b'f' => Some(c - b'a' + 10),
+                _ => None,
+            }
+        }
         let mut out = [0u8; 32];
         for (i, pair) in bytes.chunks(2).enumerate() {
-            let hex = std::str::from_utf8(pair).map_err(serde::de::Error::custom)?;
-            out[i] = u8::from_str_radix(hex, 16).map_err(serde::de::Error::custom)?;
+            match (nibble(pair[0]), nibble(pair[1])) {
+                (Some(hi), Some(lo)) => out[i] = hi << 4 | lo,
+                _ => {
+                    return Err(serde::de::Error::custom(
+                        "sha256 must be lowercase hex (0-9, a-f)",
+                    ))
+                }
+            }
         }
         Ok(Sha256Hex(out))
     }
@@ -160,7 +183,9 @@ pub struct SegmentRef {
     pub toc_sha256: Sha256Hex,
 }
 
-fn valid_segment_id(id: &str) -> bool {
+/// Segment ids become part of object keys, so only characters that cannot escape the
+/// namespace's `segments/` directory are allowed.
+pub fn valid_segment_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 128
         && id
@@ -223,6 +248,36 @@ impl ManifestContent {
     pub fn bind(&mut self, binding: IndexBinding) -> Result<(), ContentError> {
         self.check_binding(&binding)?;
         self.index_binding = Some(binding);
+        Ok(())
+    }
+
+    /// Checks that `next` may follow `self` as the next manifest version:
+    /// - once a binding is stored, every later version keeps exactly that binding;
+    /// - `indexed_through` never moves backwards and is never dropped once set.
+    ///
+    /// Pure, so the rules are testable without a store; `ManifestStore::commit_content`
+    /// applies it against the expected version.
+    pub fn check_successor(&self, next: &ManifestContent) -> Result<(), ContentError> {
+        if let Some(prev) = &self.index_binding {
+            match &next.index_binding {
+                Some(b) => prev.check(b)?,
+                None => {
+                    return Err(ContentError::BindingMismatch {
+                        field: "index_binding",
+                        manifest: format!("{prev:?}"),
+                        requested: "None".into(),
+                    })
+                }
+            }
+        }
+        if let Some(prev) = self.indexed_through {
+            if next.indexed_through.is_none_or(|n| n < prev) {
+                return Err(ContentError::IndexedThroughRegressed {
+                    previous: prev,
+                    next: next.indexed_through,
+                });
+            }
+        }
         Ok(())
     }
 

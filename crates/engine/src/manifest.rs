@@ -112,8 +112,15 @@ impl<S: ObjectStore> ManifestStore<S> {
         }
     }
 
-    /// Commits typed content. It is validated the same way readers validate it, so a manifest
-    /// that readers would reject (wrong namespace, duplicate segment) is never written.
+    /// Commits typed content. Before writing it checks:
+    /// - the content passes the same validation readers apply (namespace, segment ids), so a
+    ///   manifest readers would reject is never written;
+    /// - it may follow the `expected` version (`ManifestContent::check_successor`): the
+    ///   `IndexBinding` stays as first set and `indexed_through` never goes backwards.
+    ///
+    /// The successor check costs one GET of the expected version. If another writer commits
+    /// first, the commit fails with `CommitConflict` as usual and the caller reloads, so the
+    /// check always runs against the version this commit actually follows.
     pub fn commit_content(
         &self,
         expected: Option<Version>,
@@ -122,6 +129,13 @@ impl<S: ObjectStore> ManifestStore<S> {
     ) -> Result<Version, ManifestError> {
         let bytes = content.encode();
         ManifestContent::decode(&bytes, &self.keys).map_err(ManifestError::Content)?;
+        if let Some(v) = expected {
+            let prev = self.load(v)?.ok_or(ManifestError::CommitConflict)?;
+            let prev = ManifestContent::decode(&prev.payload, &self.keys)
+                .map_err(ManifestError::Content)?;
+            prev.check_successor(content)
+                .map_err(ManifestError::Content)?;
+        }
         self.commit(expected, commit_id, &bytes)
     }
 
