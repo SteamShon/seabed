@@ -14,11 +14,19 @@
 //! `append` returns the last `Store(Unavailable)` error: the entry may or may not have been
 //! appended.
 //!
-//! Not implemented yet (see the design doc): group commit, writer fencing (epochs), and handling
-//! of a request that is still in flight after the writer gave up on it.
+//! Retrying such an append with the same `request_id` and payload on the same `Wal` does not
+//! duplicate it: the `Wal` remembers the LSNs whose outcome was unknown (for up to
+//! `MAX_PENDING` request ids) and reads them back before trying a new one. If the entry did land,
+//! the retry returns its LSN. The memory is per `Wal` instance: a retry from another process or
+//! another `Wal`, or after a restart, may still append the entry twice.
+//!
+//! Not implemented yet (see the design doc): group commit, writer fencing (epochs), durable
+//! deduplication of retries across processes, and handling of a request that is still in flight
+//! after the writer gave up on it (its put may land after the read-back found nothing).
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use seabed_adapter_objectstore_retry::{RetryPolicy, Retrying};
 use seabed_domain::{Lsn, NamespaceKeys};
@@ -84,6 +92,18 @@ pub struct Wal<S: ObjectStore> {
     next: AtomicU64,
     max_attempts: usize,
     write_policy: RetryPolicy,
+    /// Appends that gave up with the outcome unknown, by request id: the entry and the LSNs it
+    /// may have landed at.
+    pending: Mutex<HashMap<u64, Pending>>,
+}
+
+/// How many unknown-outcome appends a `Wal` remembers. Beyond that, an arbitrary one is
+/// forgotten (its retry may then append twice).
+pub const MAX_PENDING: usize = 1024;
+
+struct Pending {
+    entry: Vec<u8>,
+    candidates: Vec<u64>,
 }
 
 impl<S: ObjectStore> Wal<S> {
@@ -99,6 +119,7 @@ impl<S: ObjectStore> Wal<S> {
             next: AtomicU64::new(0),
             max_attempts: 10_000,
             write_policy: RetryPolicy::default(),
+            pending: Mutex::new(HashMap::new()),
         })
     }
 
@@ -134,18 +155,49 @@ impl<S: ObjectStore> Wal<S> {
     }
 
     /// Appends an entry and returns its LSN. Safe to call from many threads.
+    ///
+    /// If an earlier `append` on this `Wal` with the same `request_id` and payload gave up with
+    /// the outcome unknown, the LSNs it may have landed at are checked first (see the module
+    /// docs).
     pub fn append(&self, request_id: u64, payload: &[u8]) -> Result<Lsn, WalError> {
-        let id_bytes = request_id.to_le_bytes();
         let mut entry = Vec::with_capacity(8 + payload.len());
-        entry.extend_from_slice(&id_bytes);
+        entry.extend_from_slice(&request_id.to_le_bytes());
         entry.extend_from_slice(payload);
 
+        // Candidates where an earlier put had an unknown outcome, from an earlier call too.
+        let mut unresolved = self.take_pending(request_id, &entry);
+        let result = self.append_entry(&entry, &mut unresolved);
+        if result.is_err() && !unresolved.is_empty() {
+            self.remember_pending(request_id, entry, unresolved);
+        }
+        result
+    }
+
+    fn take_pending(&self, request_id: u64, entry: &[u8]) -> Vec<u64> {
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        match pending.remove(&request_id) {
+            Some(p) if p.entry == entry => p.candidates,
+            // Same id, other payload: a different request. The old outcome stays unknown.
+            _ => Vec::new(),
+        }
+    }
+
+    fn remember_pending(&self, request_id: u64, entry: Vec<u8>, candidates: Vec<u64>) {
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        if pending.len() >= MAX_PENDING && !pending.contains_key(&request_id) {
+            if let Some(&evict) = pending.keys().next() {
+                pending.remove(&evict);
+            }
+        }
+        pending.insert(request_id, Pending { entry, candidates });
+    }
+
+    fn append_entry(&self, entry: &[u8], unresolved: &mut Vec<u64>) -> Result<Lsn, WalError> {
+        let id_bytes = &entry[..8];
         let mut candidate = match self.next.load(Ordering::SeqCst) {
             0 => self.refresh_next()?,
             n => n,
         };
-        // Candidates where an earlier put had an unknown outcome.
-        let mut unresolved: Vec<u64> = Vec::new();
         let mut budget = self.write_policy.budget();
 
         for _ in 0..self.max_attempts {
@@ -153,10 +205,10 @@ impl<S: ObjectStore> Wal<S> {
             //    entry that actually landed.
             let mut still_unresolved = Vec::new();
             let mut last_unavailable = None;
-            for &c in &unresolved {
+            for &c in unresolved.iter() {
                 match self.store.get(&self.keys.wal_key(Lsn::new(c))) {
                     Ok((bytes, _)) => {
-                        if bytes.len() >= 8 && bytes[..8] == id_bytes {
+                        if bytes.len() >= 8 && bytes[..8] == *id_bytes {
                             self.next.fetch_max(c + 1, Ordering::SeqCst);
                             return Ok(Lsn::new(c));
                         }
@@ -172,7 +224,7 @@ impl<S: ObjectStore> Wal<S> {
                     Err(e) => return Err(e.into()),
                 }
             }
-            unresolved = still_unresolved;
+            *unresolved = still_unresolved;
             if let Some(e) = last_unavailable {
                 budget.retry_or(e)?;
                 continue;
@@ -182,7 +234,7 @@ impl<S: ObjectStore> Wal<S> {
             let key = self.keys.wal_key(Lsn::new(candidate));
             match self
                 .store
-                .put(&key, entry.clone(), PutCondition::IfNoneMatch)
+                .put(&key, entry.to_vec(), PutCondition::IfNoneMatch)
             {
                 Ok(_) => {
                     self.next.fetch_max(candidate + 1, Ordering::SeqCst);

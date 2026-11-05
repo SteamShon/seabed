@@ -1024,3 +1024,35 @@ fn flush_survives_one_empty_refusal() {
     assert_eq!(f.version.get(), 1);
     assert_eq!(ids(&n.read_all().unwrap()), ["a"]);
 }
+
+/// A write whose WAL append ends with the outcome unknown (the entry landed, the response was
+/// lost) can be retried with the same request id on the same `Namespace` without appending the
+/// batch twice.
+#[test]
+fn retrying_a_write_after_an_unknown_outcome_appends_it_once() {
+    let mem = Arc::new(MemObjectStore::new());
+    let hooked = Hooked::new(&mem);
+    let n = Namespace::new(hooked.clone(), keys(), DIMS)
+        .unwrap()
+        .with_write_retry_policy(RetryPolicy::immediate(1));
+    let down = Arc::new(AtomicBool::new(true));
+    let (d, wal_prefix) = (down.clone(), keys().wal_prefix());
+    hooked.on_put(move |key| {
+        if key.as_str().starts_with(&wal_prefix) && d.load(SeqCst) {
+            PutAction::ApplyThenFail(unavailable())
+        } else {
+            PutAction::Pass
+        }
+    });
+    let batch = [Op::upsert("a", vec![]).with_attr("size", price(1))];
+    assert_eq!(
+        n.write(7, &batch),
+        Err(NamespaceError::Wal(WalError::Store(unavailable())))
+    );
+    assert_eq!(wal_entries(&mem), 1, "the entry landed");
+
+    down.store(false, SeqCst);
+    assert_eq!(n.write(7, &batch).unwrap().get(), 1, "the retry found it");
+    assert_eq!(wal_entries(&mem), 1);
+    assert_eq!(ids(&n.read_all().unwrap()), ["a"]);
+}

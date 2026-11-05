@@ -242,3 +242,144 @@ fn contention_does_not_consume_the_write_budget() {
         "conflicts happened and were retried"
     );
 }
+
+/// While `down`, every GET fails and every put is either applied with its response lost
+/// (`lose_response`) or not delivered at all. LIST always works.
+struct Outage {
+    inner: MemObjectStore,
+    down: std::sync::atomic::AtomicBool,
+    lose_response: bool,
+}
+
+impl Outage {
+    fn new(lose_response: bool) -> Arc<Self> {
+        Arc::new(Self {
+            inner: MemObjectStore::new(),
+            down: true.into(),
+            lose_response,
+        })
+    }
+    fn recover(&self) {
+        self.down.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+    fn is_down(&self) -> bool {
+        self.down.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl seabed_ports::ObjectStore for Outage {
+    fn caps(&self) -> seabed_ports::ObjectStoreCaps {
+        self.inner.caps()
+    }
+    fn get(&self, key: &seabed_domain::Key) -> Result<(Vec<u8>, seabed_domain::ETag), StoreError> {
+        if self.is_down() {
+            return Err(StoreError::Unavailable("down".into()));
+        }
+        self.inner.get(key)
+    }
+    fn get_range(
+        &self,
+        key: &seabed_domain::Key,
+        range: std::ops::Range<u64>,
+    ) -> Result<Vec<u8>, StoreError> {
+        self.inner.get_range(key, range)
+    }
+    fn put(
+        &self,
+        key: &seabed_domain::Key,
+        data: Vec<u8>,
+        cond: seabed_ports::PutCondition,
+    ) -> Result<seabed_domain::ETag, StoreError> {
+        if !self.is_down() {
+            return self.inner.put(key, data, cond);
+        }
+        if self.lose_response {
+            self.inner.put(key, data, cond)?;
+        }
+        Err(StoreError::Unavailable("down".into()))
+    }
+    fn list(&self, prefix: &str) -> Result<Vec<seabed_ports::ObjectMeta>, StoreError> {
+        self.inner.list(prefix)
+    }
+    fn delete(&self, key: &seabed_domain::Key) -> Result<(), StoreError> {
+        self.inner.delete(key)
+    }
+}
+
+fn outage_wal(store: &Arc<Outage>) -> Wal<Outage> {
+    Wal::new(store.clone(), keys())
+        .unwrap()
+        .with_retry_policy(RetryPolicy::immediate(1))
+        .with_write_retry_policy(RetryPolicy::immediate(2))
+}
+
+/// The entry landed but neither the put's response nor the read-back got through, so `append`
+/// gave up with the outcome unknown. Retrying the same request on the same `Wal` finds it and
+/// returns its LSN instead of appending it again.
+#[test]
+fn retry_after_an_unknown_outcome_returns_the_lsn_that_landed() {
+    let store = Outage::new(true);
+    let wal = outage_wal(&store);
+    assert!(matches!(
+        wal.append(1, b"x"),
+        Err(WalError::Store(StoreError::Unavailable(_)))
+    ));
+    store.recover();
+    assert_eq!(wal.append(1, b"x").unwrap(), Lsn::new(1));
+    assert_eq!(wal.append(2, b"y").unwrap(), Lsn::new(2));
+    let entries = wal.read_from(Lsn::new(1)).unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].payload, b"x");
+}
+
+/// The same, when the entry never landed: the retry finds nothing there and appends it once.
+#[test]
+fn retry_after_an_unknown_outcome_that_did_not_land_appends_once() {
+    let store = Outage::new(false);
+    let wal = outage_wal(&store);
+    assert!(wal.append(1, b"x").is_err());
+    store.recover();
+    assert_eq!(wal.append(1, b"x").unwrap(), Lsn::new(1));
+    assert_eq!(wal.read_from(Lsn::new(1)).unwrap().len(), 1);
+}
+
+/// Reusing a request id for another payload is a different request: it is appended, and the
+/// earlier one's outcome is no longer tracked.
+#[test]
+fn same_request_id_with_another_payload_is_a_new_append() {
+    let store = Outage::new(true);
+    let wal = outage_wal(&store);
+    assert!(wal.append(1, b"x").is_err());
+    store.recover();
+    assert_eq!(wal.append(1, b"other").unwrap(), Lsn::new(2));
+    assert_eq!(wal.read_from(Lsn::new(1)).unwrap().len(), 2);
+}
+
+/// Known limit, pinned so that durable deduplication changes this test on purpose: another
+/// `Wal` (another process, or after a restart) does not know the earlier attempt and appends
+/// the entry a second time.
+#[test]
+fn retry_from_another_wal_may_append_twice() {
+    let store = Outage::new(true);
+    assert!(outage_wal(&store).append(1, b"x").is_err());
+    store.recover();
+    assert_eq!(outage_wal(&store).append(1, b"x").unwrap(), Lsn::new(2));
+}
+
+/// At most `MAX_PENDING` unknown outcomes are remembered: one more forgets exactly one of them,
+/// whose retry appends a second copy; every other retry finds its entry.
+#[test]
+fn pending_outcomes_are_bounded() {
+    use seabed_engine::wal::MAX_PENDING;
+    let store = Outage::new(true);
+    let wal = outage_wal(&store);
+    let n = MAX_PENDING as u64 + 1;
+    for id in 0..n {
+        assert!(wal.append(id, &id.to_le_bytes()).is_err());
+    }
+    store.recover();
+    for id in 0..n {
+        wal.append(id, &id.to_le_bytes()).unwrap();
+    }
+    assert_eq!(wal.read_from(Lsn::new(1)).unwrap().len() as u64, n + 1);
+}
