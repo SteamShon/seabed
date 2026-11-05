@@ -284,8 +284,9 @@ impl<S: ObjectStore> Namespace<S> {
     ///
     /// `Wal(Store(Unavailable))` means the write retry budget ran out with the append's outcome
     /// unknown: the batch may or may not be in the WAL. Retrying the same batch with the same
-    /// `request_id` on the same `Namespace` is safe: the WAL checks where the earlier attempt may
-    /// have landed and returns that LSN if it did (batches encode deterministically). A retry
+    /// `request_id` on the same `Namespace` is safe, also from several threads at once: the WAL
+    /// checks where the earlier attempt may have landed and returns that LSN if it did (batches
+    /// encode deterministically, and only an identical entry counts as this batch). A retry
     /// from another process or `Namespace`, or after a restart, may still append the batch twice
     /// (harmless for a lone writer; another writer's update to the same ids in between would be
     /// overwritten).

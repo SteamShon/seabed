@@ -15,22 +15,30 @@
 //! appended.
 //!
 //! Retrying such an append with the same `request_id` and payload on the same `Wal` does not
-//! duplicate it: the `Wal` remembers the LSNs whose outcome was unknown (for up to
-//! `MAX_PENDING` request ids) and reads them back before trying a new one. If the entry did land,
-//! the retry returns its LSN. The memory is per `Wal` instance: a retry from another process or
-//! another `Wal`, or after a restart, may still append the entry twice.
+//! duplicate it: the `Wal` remembers the LSNs whose outcome was unknown and reads them back
+//! before trying a new one. A candidate counts as this append only if it holds exactly this
+//! entry (request id and payload), so another writer's entry under the same request id is never
+//! taken for ours. Once such a retry finds or makes its entry, the LSN is remembered too, so a
+//! later retry of the same request returns it without touching the store. Appends with the same
+//! request id run one at a time on a `Wal`, so concurrent retries of one request also append
+//! it once.
+//!
+//! The memory is per `Wal` instance and holds at most `MAX_PENDING` requests (a digest of the
+//! entry and a few LSNs each; the oldest is forgotten first). A retry from another process or
+//! another `Wal`, after a restart, or of a forgotten request may still append the entry twice.
 //!
 //! Not implemented yet (see the design doc): group commit, writer fencing (epochs), durable
 //! deduplication of retries across processes, and handling of a request that is still in flight
 //! after the writer gave up on it (its put may land after the read-back found nothing).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 use seabed_adapter_objectstore_retry::{RetryPolicy, Retrying};
 use seabed_domain::{Lsn, NamespaceKeys};
 use seabed_ports::{ObjectStore, PutCondition, StoreError};
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WalError {
@@ -92,18 +100,81 @@ pub struct Wal<S: ObjectStore> {
     next: AtomicU64,
     max_attempts: usize,
     write_policy: RetryPolicy,
-    /// Appends that gave up with the outcome unknown, by request id: the entry and the LSNs it
-    /// may have landed at.
-    pending: Mutex<HashMap<u64, Pending>>,
+    /// Retry memory and the request ids with an `append` in progress.
+    retries: Mutex<Retries>,
+    /// Signalled whenever an `append` finishes, for appends waiting on the same request id.
+    retry_done: Condvar,
 }
 
-/// How many unknown-outcome appends a `Wal` remembers. Beyond that, an arbitrary one is
-/// forgotten (its retry may then append twice).
+/// How many requests whose append once ended with the outcome unknown a `Wal` remembers. Beyond
+/// that, the oldest is forgotten (its retry may then append twice).
 pub const MAX_PENDING: usize = 1024;
 
+#[derive(Default)]
+struct Retries {
+    pending: PendingMap,
+    in_progress: HashSet<u64>,
+}
+
+/// What a `Wal` knows about a request whose append once ended with the outcome unknown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Outcome {
+    /// Still unknown: the LSNs the entry may have landed at.
+    Unknown(Vec<u64>),
+    /// A later retry found or made the entry here.
+    Landed(Lsn),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Pending {
-    entry: Vec<u8>,
-    candidates: Vec<u64>,
+    /// SHA-256 of the entry (request id and payload): a retry with another payload is another
+    /// request.
+    digest: [u8; 32],
+    outcome: Outcome,
+}
+
+/// Request id to `Pending`, holding at most `MAX_PENDING`, forgetting the least recently set.
+#[derive(Default)]
+struct PendingMap {
+    map: HashMap<u64, (u64, Pending)>,
+    /// (request id, generation) in the order they were set. Entries whose generation no longer
+    /// matches the map are stale and skipped.
+    order: VecDeque<(u64, u64)>,
+    generation: u64,
+}
+
+impl PendingMap {
+    fn get(&self, id: u64) -> Option<&Pending> {
+        self.map.get(&id).map(|(_, p)| p)
+    }
+
+    fn set(&mut self, id: u64, pending: Pending) {
+        self.generation += 1;
+        self.map.insert(id, (self.generation, pending));
+        self.order.push_back((id, self.generation));
+        while self.map.len() > MAX_PENDING {
+            let Some((old, generation)) = self.order.pop_front() else {
+                break;
+            };
+            if self.map.get(&old).is_some_and(|(g, _)| *g == generation) {
+                self.map.remove(&old);
+            }
+        }
+        // Keep the queue proportional to the map even when entries are replaced or removed.
+        if self.order.len() > 2 * MAX_PENDING {
+            let map = &self.map;
+            self.order
+                .retain(|(id, g)| map.get(id).is_some_and(|(cur, _)| cur == g));
+        }
+    }
+
+    fn remove(&mut self, id: u64) {
+        self.map.remove(&id);
+    }
+
+    fn len(&self) -> usize {
+        self.map.len()
+    }
 }
 
 impl<S: ObjectStore> Wal<S> {
@@ -119,7 +190,8 @@ impl<S: ObjectStore> Wal<S> {
             next: AtomicU64::new(0),
             max_attempts: 10_000,
             write_policy: RetryPolicy::default(),
-            pending: Mutex::new(HashMap::new()),
+            retries: Mutex::new(Retries::default()),
+            retry_done: Condvar::new(),
         })
     }
 
@@ -156,44 +228,84 @@ impl<S: ObjectStore> Wal<S> {
 
     /// Appends an entry and returns its LSN. Safe to call from many threads.
     ///
-    /// If an earlier `append` on this `Wal` with the same `request_id` and payload gave up with
-    /// the outcome unknown, the LSNs it may have landed at are checked first (see the module
-    /// docs).
+    /// If an earlier `append` on this `Wal` with the same `request_id` and payload ended with the
+    /// outcome unknown, the LSNs it may have landed at are checked first (see the module docs).
     pub fn append(&self, request_id: u64, payload: &[u8]) -> Result<Lsn, WalError> {
         let mut entry = Vec::with_capacity(8 + payload.len());
         entry.extend_from_slice(&request_id.to_le_bytes());
         entry.extend_from_slice(payload);
+        let digest: [u8; 32] = Sha256::digest(&entry).into();
 
-        // Candidates where an earlier put had an unknown outcome, from an earlier call too.
-        let mut unresolved = self.take_pending(request_id, &entry);
+        // One append per request id at a time, so a concurrent retry sees this one's outcome.
+        let mut retries = self.lock_retries();
+        while retries.in_progress.contains(&request_id) {
+            retries = self
+                .retry_done
+                .wait(retries)
+                .unwrap_or_else(|e| e.into_inner());
+        }
+        let earlier = match retries.pending.get(request_id) {
+            Some(p) if p.digest == digest => Some(p.outcome.clone()),
+            Some(_) => {
+                // Same id, other payload: a different request. The old outcome is dropped.
+                retries.pending.remove(request_id);
+                None
+            }
+            None => None,
+        };
+        if let Some(Outcome::Landed(lsn)) = earlier {
+            return Ok(lsn);
+        }
+        retries.in_progress.insert(request_id);
+        drop(retries);
+        let _done = InProgress {
+            wal: self,
+            request_id,
+        };
+
+        let retrying = earlier.is_some();
+        let mut unresolved = match earlier {
+            Some(Outcome::Unknown(candidates)) => candidates,
+            _ => Vec::new(),
+        };
         let result = self.append_entry(&entry, &mut unresolved);
-        if result.is_err() && !unresolved.is_empty() {
-            self.remember_pending(request_id, entry, unresolved);
+
+        let mut retries = self.lock_retries();
+        match &result {
+            Ok(lsn) if retrying => retries.pending.set(
+                request_id,
+                Pending {
+                    digest,
+                    outcome: Outcome::Landed(*lsn),
+                },
+            ),
+            Ok(_) => {}
+            Err(_) if !unresolved.is_empty() => retries.pending.set(
+                request_id,
+                Pending {
+                    digest,
+                    outcome: Outcome::Unknown(unresolved),
+                },
+            ),
+            // Every earlier candidate turned out not to be ours: nothing is unknown any more.
+            Err(_) => retries.pending.remove(request_id),
         }
         result
     }
 
-    fn take_pending(&self, request_id: u64, entry: &[u8]) -> Vec<u64> {
-        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        match pending.remove(&request_id) {
-            Some(p) if p.entry == entry => p.candidates,
-            // Same id, other payload: a different request. The old outcome stays unknown.
-            _ => Vec::new(),
-        }
+    /// How many requests this `Wal` currently remembers (see the module docs). For diagnostics
+    /// and tests.
+    pub fn pending_len(&self) -> usize {
+        self.lock_retries().pending.len()
     }
 
-    fn remember_pending(&self, request_id: u64, entry: Vec<u8>, candidates: Vec<u64>) {
-        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        if pending.len() >= MAX_PENDING && !pending.contains_key(&request_id) {
-            if let Some(&evict) = pending.keys().next() {
-                pending.remove(&evict);
-            }
-        }
-        pending.insert(request_id, Pending { entry, candidates });
+    fn lock_retries(&self) -> MutexGuard<'_, Retries> {
+        // Only map operations run under this lock, so a panic there cannot leave it half
+        // updated: recovering from poisoning is safe.
+        self.retries.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn append_entry(&self, entry: &[u8], unresolved: &mut Vec<u64>) -> Result<Lsn, WalError> {
-        let id_bytes = &entry[..8];
         let mut candidate = match self.next.load(Ordering::SeqCst) {
             0 => self.refresh_next()?,
             n => n,
@@ -208,7 +320,9 @@ impl<S: ObjectStore> Wal<S> {
             for &c in unresolved.iter() {
                 match self.store.get(&self.keys.wal_key(Lsn::new(c))) {
                     Ok((bytes, _)) => {
-                        if bytes.len() >= 8 && bytes[..8] == *id_bytes {
+                        // Only this exact entry is ours: another writer may use the same
+                        // request id.
+                        if bytes == entry {
                             self.next.fetch_max(c + 1, Ordering::SeqCst);
                             return Ok(Lsn::new(c));
                         }
@@ -287,5 +401,57 @@ impl<S: ObjectStore> Wal<S> {
             expected = lsn.next();
         }
         Ok(out)
+    }
+}
+
+/// Clears a request id's in-progress mark when its `append` returns (or panics), and wakes
+/// appends waiting on it.
+struct InProgress<'a, S: ObjectStore> {
+    wal: &'a Wal<S>,
+    request_id: u64,
+}
+
+impl<S: ObjectStore> Drop for InProgress<'_, S> {
+    fn drop(&mut self) {
+        self.wal.lock_retries().in_progress.remove(&self.request_id);
+        self.wal.retry_done.notify_all();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unknown(lsn: u64) -> Pending {
+        Pending {
+            digest: [0; 32],
+            outcome: Outcome::Unknown(vec![lsn]),
+        }
+    }
+
+    #[test]
+    fn pending_map_forgets_the_least_recently_set_first() {
+        let mut m = PendingMap::default();
+        for id in 0..MAX_PENDING as u64 {
+            m.set(id, unknown(id));
+        }
+        // Touch 0 again: now 1 is the oldest.
+        m.set(0, unknown(0));
+        m.set(9999, unknown(9999));
+        assert_eq!(m.len(), MAX_PENDING);
+        assert!(m.get(0).is_some(), "recently set");
+        assert!(m.get(1).is_none(), "oldest forgotten");
+        assert!(m.get(9999).is_some());
+    }
+
+    #[test]
+    fn pending_map_queue_stays_bounded_under_churn() {
+        let mut m = PendingMap::default();
+        for round in 0..10 * MAX_PENDING as u64 {
+            m.set(round % 3, unknown(round));
+            m.remove(round % 3);
+        }
+        assert_eq!(m.len(), 0);
+        assert!(m.order.len() <= 2 * MAX_PENDING + 1);
     }
 }

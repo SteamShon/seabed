@@ -355,6 +355,19 @@ fn same_request_id_with_another_payload_is_a_new_append() {
     assert_eq!(wal.read_from(Lsn::new(1)).unwrap().len(), 2);
 }
 
+/// A request remembered as landed answers retries without touching the store, but only for the
+/// same payload: reusing the id for another payload appends that payload.
+#[test]
+fn a_landed_request_does_not_answer_for_another_payload() {
+    let store = Outage::new(true);
+    let wal = outage_wal(&store);
+    assert!(wal.append(1, b"x").is_err());
+    store.recover();
+    assert_eq!(wal.append(1, b"x").unwrap(), Lsn::new(1));
+    assert_eq!(wal.append(1, b"other").unwrap(), Lsn::new(2));
+    assert_eq!(wal.read_from(Lsn::new(2)).unwrap()[0].payload, b"other");
+}
+
 /// Known limit, pinned so that durable deduplication changes this test on purpose: another
 /// `Wal` (another process, or after a restart) does not know the earlier attempt and appends
 /// the entry a second time.
@@ -366,10 +379,11 @@ fn retry_from_another_wal_may_append_twice() {
     assert_eq!(outage_wal(&store).append(1, b"x").unwrap(), Lsn::new(2));
 }
 
-/// At most `MAX_PENDING` unknown outcomes are remembered: one more forgets exactly one of them,
-/// whose retry appends a second copy; every other retry finds its entry.
+/// At most `MAX_PENDING` requests are remembered, the oldest forgotten first: one more than
+/// that forgets exactly the first, whose retry appends a second copy; every other retry finds
+/// its entry.
 #[test]
-fn pending_outcomes_are_bounded() {
+fn pending_outcomes_are_bounded_and_the_oldest_is_forgotten() {
     use seabed_engine::wal::MAX_PENDING;
     let store = Outage::new(true);
     let wal = outage_wal(&store);
@@ -377,9 +391,134 @@ fn pending_outcomes_are_bounded() {
     for id in 0..n {
         assert!(wal.append(id, &id.to_le_bytes()).is_err());
     }
+    assert_eq!(wal.pending_len(), MAX_PENDING);
     store.recover();
-    for id in 0..n {
+    for id in 1..n {
         wal.append(id, &id.to_le_bytes()).unwrap();
     }
-    assert_eq!(wal.read_from(Lsn::new(1)).unwrap().len() as u64, n + 1);
+    assert_eq!(
+        wal.read_from(Lsn::new(1)).unwrap().len() as u64,
+        n,
+        "no copies yet"
+    );
+    assert_eq!(wal.append(0, &0u64.to_le_bytes()).unwrap(), Lsn::new(n + 1));
+}
+
+/// Another writer (another process) uses the same request id with another payload and takes the
+/// LSN our failed attempt tried. Our retry must not take that entry for ours: it appends ours.
+#[test]
+fn retry_does_not_claim_another_writers_entry_with_the_same_request_id() {
+    let store = Outage::new(false);
+    let ours = outage_wal(&store);
+    assert!(ours.append(1, b"x").is_err());
+    store.recover();
+    assert_eq!(outage_wal(&store).append(1, b"y").unwrap(), Lsn::new(1));
+
+    assert_eq!(ours.append(1, b"x").unwrap(), Lsn::new(2));
+    let payloads: Vec<Vec<u8>> = ours
+        .read_from(Lsn::new(1))
+        .unwrap()
+        .into_iter()
+        .map(|e| e.payload)
+        .collect();
+    assert_eq!(payloads, [b"y".to_vec(), b"x".to_vec()]);
+}
+
+/// Two threads retry the same request at once on the same `Wal`: it is still appended once, and
+/// both get its LSN. Whether the first attempt landed or not: when it did not, both retries find
+/// nothing at the candidate, and only running them one at a time (the second sees the first's
+/// LSN) keeps them from appending twice.
+#[test]
+fn concurrent_retries_of_one_request_append_it_once() {
+    for round in 0..100 {
+        let store = Outage::new(round % 2 == 0);
+        let wal = outage_wal(&store);
+        assert!(wal.append(1, b"x").is_err());
+        store.recover();
+        let lsns: Vec<Lsn> = thread::scope(|sc| {
+            let hs: Vec<_> = (0..2)
+                .map(|_| sc.spawn(|| wal.append(1, b"x").unwrap()))
+                .collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert_eq!(lsns, [Lsn::new(1), Lsn::new(1)], "round {round}");
+        assert_eq!(
+            wal.read_from(Lsn::new(1)).unwrap().len(),
+            1,
+            "round {round}"
+        );
+    }
+}
+
+/// Appends whose outcome became known in the call leave nothing behind; a retried request is
+/// remembered as landed, and a further retry returns the same LSN without appending.
+#[test]
+fn only_requests_that_ended_unknown_are_remembered() {
+    // Every put lands but loses its response; read-backs work, so each append resolves its
+    // outcome within the call.
+    let flaky = Arc::new(FaultInjecting::new(
+        Arc::new(MemObjectStore::new()),
+        FaultConfig {
+            put_lose_response_ppm: 1_000_000,
+            ..FaultConfig::none()
+        },
+    ));
+    let wal = Wal::new(flaky, keys())
+        .unwrap()
+        .with_write_retry_policy(RetryPolicy::immediate(3));
+    assert_eq!(wal.append(1, b"x").unwrap(), Lsn::new(1));
+    assert_eq!(wal.pending_len(), 0, "resolved within the call");
+
+    let store = Outage::new(true);
+    let wal = outage_wal(&store);
+    assert!(wal.append(1, b"x").is_err());
+    assert_eq!(wal.pending_len(), 1);
+    store.recover();
+    assert_eq!(wal.append(1, b"x").unwrap(), Lsn::new(1));
+    assert_eq!(wal.pending_len(), 1, "remembered as landed");
+    assert_eq!(wal.append(1, b"x").unwrap(), Lsn::new(1));
+    assert_eq!(wal.append(2, b"y").unwrap(), Lsn::new(2));
+    assert_eq!(wal.pending_len(), 1, "a plain success is not remembered");
+    assert_eq!(wal.read_from(Lsn::new(1)).unwrap().len(), 2);
+}
+
+/// The retry fails again (the store is still down); its candidates are kept, and the retry after
+/// recovery still finds the entry.
+#[test]
+fn a_retry_that_fails_again_keeps_its_candidates() {
+    let store = Outage::new(true);
+    let wal = outage_wal(&store);
+    assert!(wal.append(1, b"x").is_err());
+    assert!(wal.append(1, b"x").is_err());
+    store.recover();
+    assert_eq!(wal.append(1, b"x").unwrap(), Lsn::new(1));
+    assert_eq!(wal.read_from(Lsn::new(1)).unwrap().len(), 1);
+}
+
+/// The first attempt did not land and another writer took its candidate LSN, so the retry
+/// appends at a new LSN. A further retry, sequential or concurrent, must return that LSN (the
+/// candidate no longer points at it), not append a third copy.
+#[test]
+fn retries_after_the_candidate_was_taken_return_the_new_lsn() {
+    let store = Outage::new(false);
+    let wal = outage_wal(&store);
+    assert!(wal.append(1, b"x").is_err());
+    store.recover();
+    assert_eq!(outage_wal(&store).append(9, b"other").unwrap(), Lsn::new(1));
+    assert_eq!(wal.append(1, b"x").unwrap(), Lsn::new(2));
+    assert_eq!(wal.append(1, b"x").unwrap(), Lsn::new(2));
+
+    let store = Outage::new(false);
+    let wal = outage_wal(&store);
+    assert!(wal.append(1, b"x").is_err());
+    store.recover();
+    assert_eq!(outage_wal(&store).append(9, b"other").unwrap(), Lsn::new(1));
+    let lsns: Vec<Lsn> = thread::scope(|sc| {
+        let hs: Vec<_> = (0..2)
+            .map(|_| sc.spawn(|| wal.append(1, b"x").unwrap()))
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    assert_eq!(lsns, [Lsn::new(2), Lsn::new(2)]);
+    assert_eq!(wal.read_from(Lsn::new(1)).unwrap().len(), 2);
 }
