@@ -516,7 +516,7 @@ fn pointer_put_failures_stop_early_and_the_commit_still_succeeds() {
 /// counts requests to version keys only.
 struct RefuseVersions {
     inner: MemObjectStore,
-    refusals: std::sync::atomic::AtomicUsize,
+    refusals: std::sync::Mutex<usize>,
     version_puts: std::sync::atomic::AtomicUsize,
     version_gets: std::sync::atomic::AtomicUsize,
 }
@@ -525,7 +525,7 @@ impl RefuseVersions {
     fn new(refusals: usize) -> Arc<Self> {
         Arc::new(Self {
             inner: MemObjectStore::new(),
-            refusals: refusals.into(),
+            refusals: std::sync::Mutex::new(refusals),
             version_puts: Default::default(),
             version_gets: Default::default(),
         })
@@ -557,11 +557,9 @@ impl ObjectStore for RefuseVersions {
         use std::sync::atomic::Ordering::SeqCst;
         if keys().parse_manifest_version(key).is_some() {
             self.version_puts.fetch_add(1, SeqCst);
-            let refuse = self
-                .refusals
-                .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1))
-                .is_ok();
-            if refuse {
+            let mut left = self.refusals.lock().unwrap();
+            if *left > 0 {
+                *left -= 1;
                 return Err(StoreError::Conflict);
             }
         }
