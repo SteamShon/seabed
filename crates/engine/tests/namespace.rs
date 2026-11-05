@@ -973,3 +973,54 @@ fn same_type_schema_race_both_writers_succeed_with_one_version() {
     // conflict would reload: two more version GETs.
     assert_eq!(version_gets.load(SeqCst), 4);
 }
+
+/// Every version create is refused with nothing behind it. A write that adds an attribute keeps
+/// reloading after each `CommitConflict`, so its cost is bounded by `SCHEMA_COMMIT_ATTEMPTS`
+/// (32) times the write budget, and it appends nothing.
+#[test]
+fn endless_empty_refusals_end_a_write_after_bounded_tries() {
+    let mem = Arc::new(MemObjectStore::new());
+    let hooked = Hooked::new(&mem);
+    let n = Namespace::new(hooked.clone(), keys(), DIMS)
+        .unwrap()
+        .with_write_retry_policy(RetryPolicy::immediate(3));
+    let puts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let p = puts.clone();
+    hooked.on_put(move |key| {
+        if is_manifest_version(key) {
+            p.fetch_add(1, SeqCst);
+            PutAction::Fail(StoreError::Conflict)
+        } else {
+            PutAction::Pass
+        }
+    });
+    assert_eq!(
+        n.write(1, &[Op::upsert("a", vec![]).with_attr("size", price(1))]),
+        Err(NamespaceError::Manifest(ManifestError::TooManyAttempts))
+    );
+    assert_eq!(puts.load(SeqCst), 32 * 3);
+    assert_eq!(wal_entries(&mem), 0);
+}
+
+/// One refused create with nothing behind it does not fail a flush: the commit reads the key
+/// back, finds nothing and tries again.
+#[test]
+fn flush_survives_one_empty_refusal() {
+    let mem = Arc::new(MemObjectStore::new());
+    let hooked = Hooked::new(&mem);
+    let n = Namespace::new(hooked.clone(), keys(), DIMS).unwrap();
+    n.write(1, &[Op::upsert("a", vec![])]).unwrap();
+    let armed = Arc::new(AtomicBool::new(true));
+    let a = armed.clone();
+    hooked.on_put(move |key| {
+        if is_manifest_version(key) && a.swap(false, SeqCst) {
+            PutAction::Fail(StoreError::Conflict)
+        } else {
+            PutAction::Pass
+        }
+    });
+    let f = n.flush().unwrap().expect("flushed");
+    assert!(!armed.load(SeqCst), "the refusal happened");
+    assert_eq!(f.version.get(), 1);
+    assert_eq!(ids(&n.read_all().unwrap()), ["a"]);
+}

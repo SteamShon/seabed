@@ -618,3 +618,66 @@ fn a_clean_conflict_costs_one_read_back() {
     let s = counting.stats();
     assert_eq!((s.puts, s.gets, s.lists), (1, 1, 0));
 }
+
+/// Serves version objects as missing while `stale` is set (a store that has a key but does not
+/// serve it yet), and reports the first version put as lost after applying it.
+struct LostThenStale {
+    inner: MemObjectStore,
+    stale: std::sync::atomic::AtomicBool,
+    lost_first: std::sync::atomic::AtomicBool,
+}
+
+impl ObjectStore for LostThenStale {
+    fn caps(&self) -> ObjectStoreCaps {
+        self.inner.caps()
+    }
+    fn get(&self, key: &Key) -> Result<(Vec<u8>, ETag), StoreError> {
+        use std::sync::atomic::Ordering::SeqCst;
+        if keys().parse_manifest_version(key).is_some() && self.stale.load(SeqCst) {
+            return Err(StoreError::NotFound);
+        }
+        self.inner.get(key)
+    }
+    fn get_range(&self, key: &Key, range: Range<u64>) -> Result<Vec<u8>, StoreError> {
+        self.inner.get_range(key, range)
+    }
+    fn put(&self, key: &Key, data: Vec<u8>, cond: PutCondition) -> Result<ETag, StoreError> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let result = self.inner.put(key, data, cond);
+        if keys().parse_manifest_version(key).is_some() && self.lost_first.swap(false, SeqCst) {
+            result?;
+            return Err(StoreError::Unavailable("response lost".into()));
+        }
+        result
+    }
+    fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>, StoreError> {
+        self.inner.list(prefix)
+    }
+    fn delete(&self, key: &Key) -> Result<(), StoreError> {
+        self.inner.delete(key)
+    }
+}
+
+/// The first create lands but its response is lost; later tries are refused while the store
+/// does not serve the key yet. When the budget runs out the result is `CommitConflict` (the
+/// caller reloads), even though the commit is ours; once the key is served, committing again
+/// recognises it.
+#[test]
+fn unavailable_then_stale_refusals_report_conflict_and_a_retry_recognises_the_commit() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let store = Arc::new(LostThenStale {
+        inner: MemObjectStore::new(),
+        stale: true.into(),
+        lost_first: true.into(),
+    });
+    let ms = ManifestStore::new(store.clone(), keys())
+        .unwrap()
+        .with_write_retry_policy(RetryPolicy::immediate(3));
+    assert_eq!(
+        ms.commit(None, 7, b"first"),
+        Err(ManifestError::CommitConflict)
+    );
+
+    store.stale.store(false, SeqCst);
+    assert_eq!(ms.commit(None, 7, b"first").unwrap(), Version::new(1));
+}
