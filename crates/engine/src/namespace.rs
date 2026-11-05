@@ -286,6 +286,9 @@ impl<S: ObjectStore> Namespace<S> {
     /// unknown: the batch may or may not be in the WAL. The WAL does not yet recognise a retried
     /// `request_id` across calls, so retrying may append the batch twice (harmless for a lone
     /// writer; another writer's update to the same ids in between would be overwritten).
+    /// `Manifest(Store(Unavailable))` means the same for the schema commit before the append:
+    /// nothing was appended, and retrying is safe (the commit id comes from the content, and a
+    /// reload finds the widened schema if that commit landed).
     pub fn write(&self, request_id: u64, ops: &[Op]) -> Result<Lsn, NamespaceError> {
         if ops.is_empty() {
             return Err(NamespaceError::Invalid(SotError::Format(
@@ -329,6 +332,8 @@ impl<S: ObjectStore> Namespace<S> {
     ///
     /// Fails with `Manifest(CommitConflict)` if another manifest commit landed first (another
     /// flush, or a write adding attributes); call again to flush whatever is still unindexed.
+    /// Flushes racing from the same manifest over the same WAL range commit identical content
+    /// (same commit id), so they all succeed and report the one version that was created.
     pub fn flush(&self) -> Result<Option<Flushed>, NamespaceError> {
         let (expected, mut content) = self.latest()?;
         let (tail, last) = self.tail(&content)?;

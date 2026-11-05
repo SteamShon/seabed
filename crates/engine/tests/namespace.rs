@@ -323,7 +323,13 @@ fn racing_flushes_of_the_same_range_commit_once_and_leave_no_divergent_files() {
         let hs: Vec<_> = (0..4).map(|_| sc.spawn(|| ns(&mem).flush())).collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
-    let committed = results.iter().filter(|r| matches!(r, Ok(Some(_)))).count();
+    // Flushes that start from the same manifest commit identical content, so they share a
+    // commit id: a loser that reads the winner's version back recognises it as its own commit
+    // (harmless, the content is the same). Either way, exactly one version is created.
+    let versions: BTreeSet<_> = results
+        .iter()
+        .filter_map(|r| r.as_ref().ok().and_then(|f| f.as_ref()).map(|f| f.version))
+        .collect();
     for r in &results {
         assert!(
             matches!(
@@ -335,13 +341,19 @@ fn racing_flushes_of_the_same_range_commit_once_and_leave_no_divergent_files() {
             "unexpected {r:?}"
         );
     }
-    assert_eq!(committed, 1, "exactly one flush commits");
+    assert_eq!(
+        versions.len(),
+        1,
+        "every successful flush reports the same version"
+    );
 
-    let (_, content) = ManifestStore::new(mem.clone(), keys())
+    let (latest, content) = ManifestStore::new(mem.clone(), keys())
         .unwrap()
         .load_latest_content()
         .unwrap()
         .unwrap();
+    assert_eq!(latest.get(), 1, "one manifest version");
+    assert_eq!(versions.into_iter().next(), Some(latest));
     assert_eq!(content.segments.len(), 1);
     // Same range, same id, same bytes: losers reused the winner's file instead of leaving
     // another one behind.
@@ -579,16 +591,21 @@ fn an_uncommitted_flush_does_not_block_a_later_flush_after_the_schema_grew() {
     n.write(1, &[Op::upsert("a", vec![]).with_attr("price", price(1))])
         .unwrap();
 
-    // Refuse the flush's commit as if another writer had committed first: the SoT file is
-    // written but never committed (same effect as dying before the commit).
+    // Right before the flush commits, another writer commits a new attribute (and crashes
+    // before appending it, so the WAL range stays 1..=1). The flush loses the race: its SoT file
+    // is written but never committed (same effect as dying before the commit). The next flush
+    // covers exactly the same range but must encode an extra column.
     let armed = Arc::new(AtomicBool::new(true));
-    let armed2 = armed.clone();
+    let (armed2, mem2) = (armed.clone(), mem.clone());
     hooked.on_put(move |key| {
         if is_manifest_version(key) && armed2.swap(false, SeqCst) {
-            PutAction::Fail(StoreError::PreconditionFailed)
-        } else {
-            PutAction::Pass
+            let ms = ManifestStore::new(mem2.clone(), keys()).unwrap();
+            let (v, mut c) = ms.load_latest_content().unwrap().unwrap();
+            c.extend_attr_schema(&[("color".to_string(), AttrKind::Str)].into_iter().collect())
+                .unwrap();
+            ms.commit_content(Some(v), 99, &c).unwrap();
         }
+        PutAction::Pass
     });
     assert_eq!(
         n.flush().unwrap_err(),
@@ -596,15 +613,6 @@ fn an_uncommitted_flush_does_not_block_a_later_flush_after_the_schema_grew() {
     );
     let orphan_files = segment_objects(&mem).len();
     assert_eq!(orphan_files, 1, "the abandoned flush left its SoT file");
-
-    // The schema grows WITHOUT a new WAL entry, so the next flush covers exactly the same range
-    // (1..=1) but must encode an extra column: as if a writer committed a new attribute and then
-    // crashed before appending.
-    let ms = ManifestStore::new(mem.clone(), keys()).unwrap();
-    let (v, mut c) = ms.load_latest_content().unwrap().unwrap();
-    c.extend_attr_schema(&[("color".to_string(), AttrKind::Str)].into_iter().collect())
-        .unwrap();
-    ms.commit_content(Some(v), 99, &c).unwrap();
 
     let f = n.flush().unwrap().unwrap();
     assert_eq!(

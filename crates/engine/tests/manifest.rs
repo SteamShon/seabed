@@ -366,3 +366,148 @@ fn commit_gives_up_when_the_write_budget_runs_out_and_a_later_retry_succeeds() {
     let ms = ManifestStore::new(mem, keys()).unwrap();
     assert_eq!(ms.commit(None, 7, b"first").unwrap(), Version::new(1));
 }
+
+fn faulty_counting(
+    mem: &Arc<MemObjectStore>,
+    cfg: FaultConfig,
+) -> Arc<CountingObjectStore<FaultInjecting<Arc<MemObjectStore>>>> {
+    Arc::new(CountingObjectStore::new(FaultInjecting::new(
+        mem.clone(),
+        cfg,
+    )))
+}
+
+/// The put lands but its response is lost, and the read-back fails too, so `commit` gives up
+/// with the outcome unknown. Committing again with the same `expected` and `commit_id` once the
+/// store recovers must report the version that already holds this commit, not a conflict.
+#[test]
+fn retry_after_an_unknown_outcome_recognises_the_commit_that_landed() {
+    let mem = Arc::new(MemObjectStore::new());
+    let down = faulty_counting(
+        &mem,
+        FaultConfig {
+            put_lose_response_ppm: 1_000_000,
+            get_unavailable_ppm: 1_000_000,
+            ..FaultConfig::none()
+        },
+    );
+    let ms = ManifestStore::new(down, keys())
+        .unwrap()
+        .with_retry_policy(RetryPolicy::immediate(1))
+        .with_write_retry_policy(RetryPolicy::immediate(2));
+    assert!(matches!(
+        ms.commit(None, 7, b"first"),
+        Err(ManifestError::Store(StoreError::Unavailable(_)))
+    ));
+
+    let ms = ManifestStore::new(mem, keys()).unwrap();
+    assert_eq!(ms.commit(None, 7, b"first").unwrap(), Version::new(1));
+    assert_eq!(ms.load_latest().unwrap().unwrap().commit_id, 7);
+    // A different commit for the same version is still a conflict.
+    assert_eq!(
+        ms.commit(None, 8, b"other"),
+        Err(ManifestError::CommitConflict)
+    );
+}
+
+/// A round where the put and its read-back both fail costs one try, not two; a refused put whose
+/// read-back fails costs one try too (it cannot spin on `max_attempts`).
+#[test]
+fn a_failed_put_and_a_failed_read_back_cost_one_try_per_round() {
+    for (what, cfg) in [
+        (
+            "unclear put",
+            FaultConfig {
+                put_unavailable_ppm: 1_000_000,
+                get_unavailable_ppm: 1_000_000,
+                ..FaultConfig::none()
+            },
+        ),
+        (
+            "refused put",
+            FaultConfig {
+                put_conflict_ppm: 1_000_000,
+                get_unavailable_ppm: 1_000_000,
+                ..FaultConfig::none()
+            },
+        ),
+    ] {
+        let store = faulty_counting(&Arc::new(MemObjectStore::new()), cfg);
+        let ms = ManifestStore::new(store.clone(), keys())
+            .unwrap()
+            .with_retry_policy(RetryPolicy::immediate(1))
+            .with_write_retry_policy(RetryPolicy::immediate(3));
+        assert!(
+            matches!(
+                ms.commit(None, 1, b"x"),
+                Err(ManifestError::Store(StoreError::Unavailable(_)))
+            ),
+            "{what}"
+        );
+        let s = store.stats();
+        assert_eq!((s.puts, s.gets), (3, 3), "{what}");
+    }
+}
+
+/// Puts to the pointer key always fail; everything else works.
+struct PointerDown {
+    inner: MemObjectStore,
+    pointer_puts: std::sync::atomic::AtomicUsize,
+}
+
+impl ObjectStore for PointerDown {
+    fn caps(&self) -> ObjectStoreCaps {
+        self.inner.caps()
+    }
+    fn get(&self, key: &Key) -> Result<(Vec<u8>, ETag), StoreError> {
+        self.inner.get(key)
+    }
+    fn get_range(&self, key: &Key, range: Range<u64>) -> Result<Vec<u8>, StoreError> {
+        self.inner.get_range(key, range)
+    }
+    fn put(&self, key: &Key, data: Vec<u8>, cond: PutCondition) -> Result<ETag, StoreError> {
+        if *key == keys().manifest_pointer_key() {
+            self.pointer_puts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return Err(StoreError::Unavailable("pointer down".into()));
+        }
+        self.inner.put(key, data, cond)
+    }
+    fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>, StoreError> {
+        self.inner.list(prefix)
+    }
+    fn delete(&self, key: &Key) -> Result<(), StoreError> {
+        self.inner.delete(key)
+    }
+}
+
+/// The pointer is best effort: when it cannot be written, the commit still succeeds after at
+/// most `POINTER_RETRY_ATTEMPTS` pointer puts, and readers still find the version.
+#[test]
+fn pointer_put_failures_stop_early_and_the_commit_still_succeeds() {
+    use seabed_engine::manifest::POINTER_RETRY_ATTEMPTS;
+    let store = Arc::new(PointerDown {
+        inner: MemObjectStore::new(),
+        pointer_puts: Default::default(),
+    });
+    let ms = ManifestStore::new(store.clone(), keys())
+        .unwrap()
+        .with_write_retry_policy(RetryPolicy::immediate(5));
+    assert_eq!(ms.commit(None, 1, b"first").unwrap(), Version::new(1));
+    assert_eq!(
+        store.pointer_puts.load(std::sync::atomic::Ordering::SeqCst),
+        POINTER_RETRY_ATTEMPTS
+    );
+    assert_eq!(ms.load_latest().unwrap().unwrap().version, Version::new(1));
+
+    // A write policy smaller than the cap wins.
+    store
+        .pointer_puts
+        .store(0, std::sync::atomic::Ordering::SeqCst);
+    let ms = ms.with_write_retry_policy(RetryPolicy::immediate(1));
+    ms.commit(Some(Version::new(1)), 2, b"second").unwrap();
+    assert_eq!(
+        store.pointer_puts.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+}

@@ -625,9 +625,7 @@ impl<S: ObjectStore> SotStore<S> {
                 Err(e) => return Err(e.into()),
             }
             if let Some(e) = transient {
-                if !budget.wait() {
-                    return Err(e.into());
-                }
+                budget.retry_or(e)?;
             }
         }
         Err(SotError::Store(StoreError::Unavailable(

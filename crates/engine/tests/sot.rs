@@ -872,3 +872,27 @@ fn write_gives_up_when_the_write_budget_runs_out_and_a_later_retry_succeeds() {
         .write(&keys(), "seg-0001", &sample(), &test_schema(), DIMS)
         .unwrap();
 }
+
+/// The key is reported taken but cannot be read back: each such round costs one try of the
+/// write budget, so `write` stops there instead of running to its contention limit.
+#[test]
+fn a_refused_put_with_a_failed_read_back_costs_the_write_budget() {
+    use seabed_adapter_objectstore_mem::CountingObjectStore;
+    let store = Arc::new(CountingObjectStore::new(FaultInjecting::new(
+        Arc::new(MemObjectStore::new()),
+        FaultConfig {
+            put_conflict_ppm: 1_000_000,
+            get_unavailable_ppm: 1_000_000,
+            ..FaultConfig::none()
+        },
+    )));
+    let sots = SotStore::new(store.clone())
+        .with_retry_policy(RetryPolicy::immediate(1))
+        .with_write_retry_policy(RetryPolicy::immediate(3));
+    assert!(matches!(
+        sots.write(&keys(), "seg-0001", &sample(), &test_schema(), DIMS),
+        Err(SotError::Store(seabed_ports::StoreError::Unavailable(_)))
+    ));
+    let s = store.stats();
+    assert_eq!((s.puts, s.gets), (3, 3));
+}

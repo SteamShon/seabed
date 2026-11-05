@@ -75,9 +75,13 @@ impl RetryPolicy {
 
 /// The retries left in one caller-driven loop, with the same timing as `Retrying` reads.
 ///
-/// Call [`RetryBudget::wait`] after each transient failure: it sleeps the next backoff delay and
-/// returns `true`, or returns `false` once `max_attempts` tries have been used (the first try
-/// counts), in which case the caller gives up.
+/// Call [`RetryBudget::retry_or`] (or [`RetryBudget::wait`]) after each transient failure: it
+/// sleeps the next backoff delay and lets the caller retry, or, once `max_attempts` tries have
+/// been used (the first try counts), tells it to give up.
+///
+/// With the default policy and jitter off, the delays are 20, 40, 80, 160, 320, 640 and 1000 ms:
+/// about 2.26 s of sleep before giving up. Jitter adds up to one more delay to each, so up to
+/// about 4.5 s.
 ///
 /// ```
 /// use seabed_adapter_objectstore_retry::RetryPolicy;
@@ -93,9 +97,14 @@ pub struct RetryBudget {
 }
 
 impl RetryBudget {
+    /// Takes the next retry's delay without sleeping, or `None` if no retry is left.
+    pub fn next_delay(&mut self) -> Option<std::time::Duration> {
+        self.delays.next()
+    }
+
     /// Sleeps before the next retry and returns `true`, or returns `false` if none is left.
     pub fn wait(&mut self) -> bool {
-        match self.delays.next() {
+        match self.next_delay() {
             Some(d) => {
                 if !d.is_zero() {
                     std::thread::sleep(d);
@@ -103,6 +112,16 @@ impl RetryBudget {
                 true
             }
             None => false,
+        }
+    }
+
+    /// After a transient failure `e`: sleeps and returns `Ok(())` so the caller retries, or
+    /// returns `Err(e)` once the budget is spent, so the caller gives up with that failure.
+    pub fn retry_or<E>(&mut self, e: E) -> Result<(), E> {
+        if self.wait() {
+            Ok(())
+        } else {
+            Err(e)
         }
     }
 }

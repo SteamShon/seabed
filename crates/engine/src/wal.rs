@@ -147,14 +147,6 @@ impl<S: ObjectStore> Wal<S> {
         // Candidates where an earlier put had an unknown outcome.
         let mut unresolved: Vec<u64> = Vec::new();
         let mut budget = self.write_policy.budget();
-        // Called on every transient failure: backs off, or gives up with that failure.
-        let mut transient = |e: StoreError| -> Result<(), WalError> {
-            if budget.wait() {
-                Ok(())
-            } else {
-                Err(WalError::Store(e))
-            }
-        };
 
         for _ in 0..self.max_attempts {
             // 1. Resolve earlier ambiguous attempts first, so a retry can never duplicate an
@@ -182,7 +174,7 @@ impl<S: ObjectStore> Wal<S> {
             }
             unresolved = still_unresolved;
             if let Some(e) = last_unavailable {
-                transient(e)?;
+                budget.retry_or(e)?;
                 continue;
             }
 
@@ -202,7 +194,7 @@ impl<S: ObjectStore> Wal<S> {
                 }
                 Err(e @ StoreError::Unavailable(_)) => {
                     unresolved.push(candidate);
-                    transient(e)?;
+                    budget.retry_or(e)?;
                 }
                 Err(e) => return Err(e.into()),
             }

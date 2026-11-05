@@ -208,3 +208,26 @@ fn budget_sleeps_between_retries() {
     assert!(!budget.wait());
     assert!(start.elapsed() >= std::time::Duration::from_millis(20));
 }
+
+/// Pins how long the default policy keeps a caller-driven loop going before it gives up.
+#[test]
+fn default_budget_delay_sequence() {
+    let policy = RetryPolicy {
+        jitter: false,
+        ..RetryPolicy::default()
+    };
+    let mut budget = policy.budget();
+    // backon computes the doubling in floating point, so compare rounded milliseconds.
+    let delays: Vec<u64> = std::iter::from_fn(|| budget.next_delay())
+        .map(|d| (d.as_secs_f64() * 1000.0).round() as u64)
+        .collect();
+    assert_eq!(delays, [20, 40, 80, 160, 320, 640, 1000]);
+    assert_eq!(delays.iter().sum::<u64>(), 2260);
+}
+
+#[test]
+fn retry_or_hands_back_the_failure_once_the_budget_is_spent() {
+    let mut budget = RetryPolicy::immediate(2).budget();
+    assert_eq!(budget.retry_or("first"), Ok(()));
+    assert_eq!(budget.retry_or("second"), Err("second"));
+}
