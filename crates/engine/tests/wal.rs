@@ -6,8 +6,9 @@ use seabed_adapter_objectstore_mem::{
     CountingObjectStore, FaultConfig, FaultInjecting, MemObjectStore,
 };
 use seabed_domain::{Lsn, NamespaceId, NamespaceKeys, TenantId};
-use seabed_engine::wal::Wal;
+use seabed_engine::wal::{Wal, WalError};
 use seabed_engine::RetryPolicy;
+use seabed_ports::StoreError;
 
 fn keys() -> NamespaceKeys {
     NamespaceKeys::new(
@@ -82,7 +83,8 @@ fn lost_responses_do_not_duplicate_or_lose_entries() {
     let faulty = Arc::new(FaultInjecting::new(mem.clone(), cfg));
     let wal = Wal::new(faulty, keys())
         .unwrap()
-        .with_retry_policy(RetryPolicy::immediate(32));
+        .with_retry_policy(RetryPolicy::immediate(32))
+        .with_write_retry_policy(RetryPolicy::immediate(64));
 
     thread::scope(|sc| {
         for t in 0..4u64 {
@@ -171,4 +173,72 @@ fn default_constructor_retries_reads_without_extra_wiring() {
     // No retry policy, no decorator: the default policy (with backoff) applies.
     let reader = Wal::new(Arc::new(FaultInjecting::new(mem, cfg)), keys()).unwrap();
     assert_eq!(reader.read_from(Lsn::new(1)).unwrap().len(), 10);
+}
+
+fn store_with(cfg: FaultConfig) -> Arc<CountingObjectStore<FaultInjecting<Arc<MemObjectStore>>>> {
+    Arc::new(CountingObjectStore::new(FaultInjecting::new(
+        Arc::new(MemObjectStore::new()),
+        cfg,
+    )))
+}
+
+/// Every put fails without being applied. Each failure costs one try of the write budget, and
+/// when it runs out `append` returns the last failure instead of spinning.
+#[test]
+fn append_gives_up_when_the_write_budget_runs_out() {
+    let store = store_with(FaultConfig {
+        put_unavailable_ppm: 1_000_000,
+        ..FaultConfig::none()
+    });
+    let wal = Wal::new(store.clone(), keys())
+        .unwrap()
+        .with_write_retry_policy(RetryPolicy::immediate(3));
+    assert!(matches!(
+        wal.append(1, b"x"),
+        Err(WalError::Store(StoreError::Unavailable(_)))
+    ));
+    assert_eq!(store.stats().puts, 3, "3 tries, then give up");
+}
+
+/// The read-back of an unclear put keeps failing too: it also costs the write budget, so the
+/// resolution loop cannot spin either.
+#[test]
+fn unresolvable_appends_stop_at_the_write_budget() {
+    let store = store_with(FaultConfig {
+        put_unavailable_ppm: 1_000_000,
+        get_unavailable_ppm: 1_000_000,
+        ..FaultConfig::none()
+    });
+    let wal = Wal::new(store.clone(), keys())
+        .unwrap()
+        .with_retry_policy(RetryPolicy::immediate(1))
+        .with_write_retry_policy(RetryPolicy::immediate(3));
+    assert!(matches!(
+        wal.append(1, b"x"),
+        Err(WalError::Store(StoreError::Unavailable(_)))
+    ));
+    let s = store.stats();
+    // Try 1: the put fails. Tries 2 and 3: the read-back fails. Then give up.
+    assert_eq!((s.puts, s.gets), (1, 2));
+}
+
+/// Losing LSNs to other writers is not a store failure: a write budget of one try still lets
+/// every append through when half of all conditional puts conflict.
+#[test]
+fn contention_does_not_consume_the_write_budget() {
+    let store = store_with(FaultConfig {
+        seed: 7,
+        put_conflict_ppm: 500_000,
+        ..FaultConfig::none()
+    });
+    let wal = Wal::new(store.clone(), keys())
+        .unwrap()
+        .with_write_retry_policy(RetryPolicy::immediate(1));
+    for i in 1..=50u64 {
+        assert_eq!(wal.append(i, b"x").unwrap(), Lsn::new(i));
+    }
+    assert!(
+        store.stats().puts > 60,
+        "conflicts happened and were retried"
+    );
 }
