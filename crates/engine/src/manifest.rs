@@ -53,10 +53,17 @@ pub struct Manifest {
 /// wrapper: `commit` resolves ambiguous put outcomes itself. Pass a `RetryPolicy` with
 /// `with_retry_policy` to change the read budget. `Retrying` does not implement `ObjectStore`, so
 /// passing an already-retrying store here does not compile.
+///
+/// Inside `commit`, transient failures (`Unavailable` from a put, or from a read-back that still
+/// fails after the read retries) are retried with backoff under the write retry policy
+/// (`with_write_retry_policy`). When it runs out, `commit` returns the last `Store(Unavailable)`
+/// error: the version may or may not have been created. Committing again with the same
+/// `expected` and `commit_id` resolves it.
 pub struct ManifestStore<S: ObjectStore> {
     store: Retrying<Arc<S>>,
     keys: NamespaceKeys,
     max_attempts: usize,
+    write_policy: RetryPolicy,
 }
 
 impl<S: ObjectStore> ManifestStore<S> {
@@ -70,7 +77,15 @@ impl<S: ObjectStore> ManifestStore<S> {
             store: Retrying::new(store, RetryPolicy::default()),
             keys,
             max_attempts: 1_000,
+            write_policy: RetryPolicy::default(),
         })
+    }
+
+    /// Replaces the budget and backoff for transient failures inside `commit` (see the type
+    /// docs). The default is `RetryPolicy::default()`.
+    pub fn with_write_retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.write_policy = policy;
+        self
     }
 
     /// Replaces the read retry policy. `RetryPolicy::immediate(1)` disables read retries.
@@ -177,6 +192,7 @@ impl<S: ObjectStore> ManifestStore<S> {
     fn advance_pointer(&self, to: Version) -> Result<(), ManifestError> {
         let key = self.keys.manifest_pointer_key();
         let value = to.get().to_le_bytes().to_vec();
+        let mut budget = self.write_policy.budget();
         for _ in 0..self.max_attempts {
             let cond = match self.read_pointer()? {
                 Some((cur, _)) if cur >= to => return Ok(()),
@@ -185,10 +201,14 @@ impl<S: ObjectStore> ManifestStore<S> {
             };
             match self.store.put(&key, value.clone(), cond) {
                 Ok(_) => return Ok(()),
-                // Lost a race, or the outcome is unknown: re-read and decide again.
-                Err(StoreError::PreconditionFailed)
-                | Err(StoreError::Conflict)
-                | Err(StoreError::Unavailable(_)) => {}
+                // Lost a race: re-read and decide again.
+                Err(StoreError::PreconditionFailed) | Err(StoreError::Conflict) => {}
+                // Outcome unknown: back off, then re-read and decide again.
+                Err(e @ StoreError::Unavailable(_)) => {
+                    if !budget.wait() {
+                        return Err(e.into());
+                    }
+                }
                 Err(e) => return Err(e.into()),
             }
         }
@@ -248,11 +268,17 @@ impl<S: ObjectStore> ManifestStore<S> {
         let key = self.keys.manifest_key(next);
         // True once an attempt had an unknown outcome: that attempt may have landed.
         let mut maybe_landed = false;
+        let mut budget = self.write_policy.budget();
         for _ in 0..self.max_attempts {
             let outcome = self
                 .store
                 .put(&key, entry.clone(), PutCondition::IfNoneMatch);
-            let ambiguous = matches!(outcome, Err(StoreError::Unavailable(_)));
+            // The transient failure this round, if any; it costs one retry from `budget`.
+            let mut transient = match &outcome {
+                Err(e @ StoreError::Unavailable(_)) => Some(e.clone()),
+                _ => None,
+            };
+            let ambiguous = transient.is_some();
             let rejected = matches!(
                 outcome,
                 Err(StoreError::PreconditionFailed) | Err(StoreError::Conflict)
@@ -278,8 +304,14 @@ impl<S: ObjectStore> ManifestStore<S> {
                         Err(ManifestError::CommitConflict)
                     };
                 }
-                Err(StoreError::NotFound) | Err(StoreError::Unavailable(_)) => {}
+                Err(StoreError::NotFound) => {}
+                Err(e @ StoreError::Unavailable(_)) => transient = Some(e),
                 Err(e) => return Err(e.into()),
+            }
+            if let Some(e) = transient {
+                if !budget.wait() {
+                    return Err(e.into());
+                }
             }
         }
         Err(ManifestError::TooManyAttempts)

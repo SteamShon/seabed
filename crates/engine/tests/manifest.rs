@@ -105,7 +105,8 @@ fn concurrent_commits_survive_injected_faults() {
     // Retries are built in; only the policy is swapped for one that does not sleep.
     let ms = ManifestStore::new(faulty, keys())
         .unwrap()
-        .with_retry_policy(RetryPolicy::immediate(32));
+        .with_retry_policy(RetryPolicy::immediate(32))
+        .with_write_retry_policy(RetryPolicy::immediate(64));
     run_contended_commits(&ms);
 }
 
@@ -339,4 +340,29 @@ fn own_commit_is_recognised_after_lost_response_then_precondition_failed() {
     assert_eq!(latest.version, Version::new(1), "no duplicate version");
     assert_eq!(latest.commit_id, 77);
     assert_eq!(latest.payload, b"mine");
+}
+
+/// Every version put fails without being applied. `commit` gives up when the write budget runs
+/// out, returning the last failure; once the store recovers, the same commit goes through.
+#[test]
+fn commit_gives_up_when_the_write_budget_runs_out_and_a_later_retry_succeeds() {
+    let mem = Arc::new(MemObjectStore::new());
+    let down = Arc::new(CountingObjectStore::new(FaultInjecting::new(
+        mem.clone(),
+        FaultConfig {
+            put_unavailable_ppm: 1_000_000,
+            ..FaultConfig::none()
+        },
+    )));
+    let ms = ManifestStore::new(down.clone(), keys())
+        .unwrap()
+        .with_write_retry_policy(RetryPolicy::immediate(3));
+    assert!(matches!(
+        ms.commit(None, 7, b"first"),
+        Err(ManifestError::Store(StoreError::Unavailable(_)))
+    ));
+    assert_eq!(down.stats().puts, 3, "3 tries, then give up");
+
+    let ms = ManifestStore::new(mem, keys()).unwrap();
+    assert_eq!(ms.commit(None, 7, b"first").unwrap(), Version::new(1));
 }

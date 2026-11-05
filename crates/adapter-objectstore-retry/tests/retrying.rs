@@ -182,3 +182,29 @@ fn default_policy_backs_off() {
 fn store_calls(store: &Retrying<Scripted>) -> usize {
     store.inner().calls()
 }
+
+#[test]
+fn budget_counts_the_first_try() {
+    let mut one = RetryPolicy::immediate(1).budget();
+    assert!(!one.wait(), "max_attempts 1: no retry at all");
+
+    let mut four = RetryPolicy::immediate(4).budget();
+    let retries = std::iter::from_fn(|| four.wait().then_some(())).count();
+    assert_eq!(retries, 3, "4 tries = the first + 3 retries");
+}
+
+#[test]
+fn budget_sleeps_between_retries() {
+    let policy = RetryPolicy {
+        max_attempts: 3,
+        min_delay: std::time::Duration::from_millis(10),
+        max_delay: std::time::Duration::from_millis(10),
+        jitter: false,
+    };
+    let mut budget = policy.budget();
+    let start = std::time::Instant::now();
+    assert!(budget.wait());
+    assert!(budget.wait());
+    assert!(!budget.wait());
+    assert!(start.elapsed() >= std::time::Duration::from_millis(20));
+}

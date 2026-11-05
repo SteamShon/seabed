@@ -403,7 +403,8 @@ fn reads_and_flushes_survive_injected_faults() {
         DIMS,
     )
     .unwrap()
-    .with_retry_policy(RetryPolicy::immediate(64));
+    .with_retry_policy(RetryPolicy::immediate(64))
+    .with_write_retry_policy(RetryPolicy::immediate(64));
     for i in 0..10u64 {
         n.write(i, &[Op::upsert(&format!("d{i}"), vec![])]).unwrap();
         if i % 3 == 0 {
@@ -763,23 +764,29 @@ fn write_request_cost_is_pinned() {
 fn failed_append_after_schema_commit_keeps_the_type_and_retries_cleanly() {
     let mem = Arc::new(MemObjectStore::new());
     let hooked = Hooked::new(&mem);
-    let n = Namespace::new(hooked.clone(), keys(), DIMS).unwrap();
+    let n = Namespace::new(hooked.clone(), keys(), DIMS)
+        .unwrap()
+        .with_write_retry_policy(RetryPolicy::immediate(4));
     let wal_down = Arc::new(AtomicBool::new(true));
-    let down = wal_down.clone();
+    let wal_puts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (down, puts) = (wal_down.clone(), wal_puts.clone());
     let wal_prefix = keys().wal_prefix();
     hooked.on_put(move |key| {
         if key.as_str().starts_with(&wal_prefix) && down.load(SeqCst) {
+            puts.fetch_add(1, SeqCst);
             PutAction::Fail(unavailable())
         } else {
             PutAction::Pass
         }
     });
     let batch = [Op::upsert("a", vec![]).with_attr("size", AttrValue::Str("s".into()))];
-    // The WAL resolves each unclear put (NotFound) and tries the next one until it gives up.
+    // Each unclear put costs one try of the write retry budget; when it runs out the last
+    // failure is returned (the outcome of that put is unknown to the writer).
     assert_eq!(
         n.write(7, &batch),
-        Err(NamespaceError::Wal(WalError::TooManyAttempts))
+        Err(NamespaceError::Wal(WalError::Store(unavailable())))
     );
+    assert_eq!(wal_puts.load(SeqCst), 4, "4 tries, then give up");
     assert_eq!(wal_entries(&mem), 0);
 
     let (_, content) = latest_manifest(&mem);
@@ -864,4 +871,46 @@ fn schema_commit_store_error_is_returned_not_retried() {
     );
     assert_eq!(puts.load(SeqCst), 1, "not retried");
     assert_eq!(wal_entries(&mem), 0);
+}
+
+/// `Namespace::with_write_retry_policy` reaches the manifest and the SoT store too, not only the
+/// WAL: with those writes failing, `write` and `flush` give up after the configured tries.
+#[test]
+fn write_retry_policy_applies_to_manifest_commits_and_sot_writes() {
+    let mem = Arc::new(MemObjectStore::new());
+    let hooked = Hooked::new(&mem);
+    let n = Namespace::new(hooked.clone(), keys(), DIMS)
+        .unwrap()
+        .with_write_retry_policy(RetryPolicy::immediate(4));
+    let failing = Arc::new(Mutex::new(String::new()));
+    let puts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (f, p) = (failing.clone(), puts.clone());
+    hooked.on_put(move |key| {
+        let what = f.lock().unwrap().clone();
+        if !what.is_empty() && key.as_str().contains(what.as_str()) {
+            p.fetch_add(1, SeqCst);
+            PutAction::Fail(unavailable())
+        } else {
+            PutAction::Pass
+        }
+    });
+
+    // A new attribute needs a manifest commit first.
+    *failing.lock().unwrap() = keys().manifest_key(Version::new(1)).as_str().to_string();
+    assert_eq!(
+        n.write(1, &[Op::upsert("a", vec![]).with_attr("size", price(1))]),
+        Err(NamespaceError::Manifest(
+            ManifestError::Store(unavailable())
+        ))
+    );
+    assert_eq!(puts.swap(0, SeqCst), 4);
+
+    // Flushing needs a SoT write.
+    *failing.lock().unwrap() = "/segments/".to_string();
+    n.write(2, &[Op::upsert("b", vec![])]).unwrap();
+    assert_eq!(
+        n.flush(),
+        Err(NamespaceError::Sot(SotError::Store(unavailable())))
+    );
+    assert_eq!(puts.load(SeqCst), 4);
 }

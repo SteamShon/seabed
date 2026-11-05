@@ -644,6 +644,7 @@ fn concurrent_commit_content_with_faults_keeps_successor_rules() {
             )
             .unwrap()
             .with_retry_policy(RetryPolicy::immediate(64))
+            .with_write_retry_policy(RetryPolicy::immediate(64))
         };
         let ms = store_for(seed * 1000);
         // Even a lone writer can see an injected 409 (`CommitConflict`); the contract is to

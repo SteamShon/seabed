@@ -14,7 +14,7 @@
 use std::ops::Range;
 use std::time::Duration;
 
-use backon::{BlockingRetryable, ExponentialBuilder};
+use backon::{BackoffBuilder, BlockingRetryable, ExponentialBackoff, ExponentialBuilder};
 use seabed_domain::{ETag, Key};
 use seabed_ports::{ObjectMeta, ObjectStore, ObjectStoreCaps, PutCondition, StoreError};
 
@@ -52,6 +52,14 @@ impl RetryPolicy {
         }
     }
 
+    /// Starts a retry budget for a caller-driven loop, such as a write whose outcome the caller
+    /// resolves itself. See [`RetryBudget`].
+    pub fn budget(&self) -> RetryBudget {
+        RetryBudget {
+            delays: self.backoff().build(),
+        }
+    }
+
     fn backoff(&self) -> ExponentialBuilder {
         let b = ExponentialBuilder::default()
             .with_min_delay(self.min_delay)
@@ -61,6 +69,40 @@ impl RetryPolicy {
             b.with_jitter()
         } else {
             b
+        }
+    }
+}
+
+/// The retries left in one caller-driven loop, with the same timing as `Retrying` reads.
+///
+/// Call [`RetryBudget::wait`] after each transient failure: it sleeps the next backoff delay and
+/// returns `true`, or returns `false` once `max_attempts` tries have been used (the first try
+/// counts), in which case the caller gives up.
+///
+/// ```
+/// use seabed_adapter_objectstore_retry::RetryPolicy;
+///
+/// let mut budget = RetryPolicy::immediate(3).budget();
+/// assert!(budget.wait()); // retry 1
+/// assert!(budget.wait()); // retry 2
+/// assert!(!budget.wait()); // 3 tries used: give up
+/// ```
+#[derive(Debug)]
+pub struct RetryBudget {
+    delays: ExponentialBackoff,
+}
+
+impl RetryBudget {
+    /// Sleeps before the next retry and returns `true`, or returns `false` if none is left.
+    pub fn wait(&mut self) -> bool {
+        match self.delays.next() {
+            Some(d) => {
+                if !d.is_zero() {
+                    std::thread::sleep(d);
+                }
+                true
+            }
+            None => false,
         }
     }
 }

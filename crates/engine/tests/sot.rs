@@ -847,3 +847,28 @@ proptest! {
         prop_assert_eq!(sot::encode(&back, &schema, DIMS).unwrap(), bytes);
     }
 }
+
+/// Every put fails without being applied. `write` gives up when the write budget runs out,
+/// returning the last failure; once the store recovers, the same write goes through.
+#[test]
+fn write_gives_up_when_the_write_budget_runs_out_and_a_later_retry_succeeds() {
+    use seabed_adapter_objectstore_mem::CountingObjectStore;
+    let mem = Arc::new(MemObjectStore::new());
+    let down = Arc::new(CountingObjectStore::new(FaultInjecting::new(
+        mem.clone(),
+        FaultConfig {
+            put_unavailable_ppm: 1_000_000,
+            ..FaultConfig::none()
+        },
+    )));
+    let sots = SotStore::new(down.clone()).with_write_retry_policy(RetryPolicy::immediate(3));
+    assert!(matches!(
+        sots.write(&keys(), "seg-0001", &sample(), &test_schema(), DIMS),
+        Err(SotError::Store(seabed_ports::StoreError::Unavailable(_)))
+    ));
+    assert_eq!(down.stats().puts, 3, "3 tries, then give up");
+
+    SotStore::new(mem)
+        .write(&keys(), "seg-0001", &sample(), &test_schema(), DIMS)
+        .unwrap();
+}

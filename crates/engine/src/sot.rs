@@ -64,7 +64,8 @@ pub const DOCS_FILE: &str = "docs.parquet";
 pub const MAX_ID_LEN: usize = 256;
 pub const MAX_ATTR_NAME_LEN: usize = 64;
 pub const SOT_FORMAT_VERSION: u32 = 1;
-/// Attempts for one create-only SoT write before giving up on an unclear outcome.
+/// Attempts for one create-only SoT write when the key is reported taken but cannot be read yet.
+/// Transient failures have their own budget (`SotStore::with_write_retry_policy`).
 const MAX_PUT_ATTEMPTS: usize = 32;
 const KEY_VERSION: &str = "seabed.sot.format_version";
 const KEY_DIMS: &str = "seabed.sot.dims";
@@ -550,13 +551,22 @@ fn sha256(data: &[u8]) -> [u8; 32] {
 /// `write` retries an unclear put itself and accepts the key only if it holds the same bytes.
 pub struct SotStore<S: ObjectStore> {
     store: Retrying<Arc<S>>,
+    write_policy: RetryPolicy,
 }
 
 impl<S: ObjectStore> SotStore<S> {
     pub fn new(store: Arc<S>) -> Self {
         Self {
             store: Retrying::new(store, RetryPolicy::default()),
+            write_policy: RetryPolicy::default(),
         }
+    }
+
+    /// Replaces the budget and backoff for transient failures inside `write`. The default is
+    /// `RetryPolicy::default()`.
+    pub fn with_write_retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.write_policy = policy;
+        self
     }
 
     pub fn with_retry_policy(mut self, policy: RetryPolicy) -> Self {
@@ -574,6 +584,10 @@ impl<S: ObjectStore> SotStore<S> {
     /// Encodes `rows` and creates the segment's SoT file. Never overwrites: if the key already
     /// holds exactly these bytes the write succeeds (idempotent retry), otherwise
     /// `AlreadyExists`.
+    ///
+    /// Transient failures (`Unavailable` from the put, or from the read-back after the read
+    /// retries) are retried with backoff under the write retry policy. When it runs out, the last
+    /// `Store(Unavailable)` error is returned; calling `write` again resolves the outcome.
     pub fn write(
         &self,
         keys: &NamespaceKeys,
@@ -592,23 +606,29 @@ impl<S: ObjectStore> SotStore<S> {
         // write of the same WAL range produces the same bytes. Whenever the outcome is unclear
         // or the key is taken, look at what is there: the same bytes count as success, other
         // bytes are a real conflict, nothing yet means try again.
+        let mut budget = self.write_policy.budget();
         for _ in 0..MAX_PUT_ATTEMPTS {
-            let outcome = self
+            let mut transient = match self
                 .store
-                .put(&key, bytes.clone(), PutCondition::IfNoneMatch);
-            let retry_put = match outcome {
+                .put(&key, bytes.clone(), PutCondition::IfNoneMatch)
+            {
                 Ok(_) => return Ok(r),
-                Err(StoreError::PreconditionFailed)
-                | Err(StoreError::Conflict)
-                | Err(StoreError::Unavailable(_)) => match self.store.get(&key) {
-                    Ok((existing, _)) if sha256(&existing) == r.sha256.0 => return Ok(r),
-                    Ok(_) => return Err(SotError::AlreadyExists),
-                    Err(StoreError::NotFound) | Err(StoreError::Unavailable(_)) => true,
-                    Err(e) => return Err(e.into()),
-                },
+                Err(StoreError::PreconditionFailed) | Err(StoreError::Conflict) => None,
+                Err(e @ StoreError::Unavailable(_)) => Some(e),
                 Err(e) => return Err(e.into()),
             };
-            debug_assert!(retry_put);
+            match self.store.get(&key) {
+                Ok((existing, _)) if sha256(&existing) == r.sha256.0 => return Ok(r),
+                Ok(_) => return Err(SotError::AlreadyExists),
+                Err(StoreError::NotFound) => {}
+                Err(e @ StoreError::Unavailable(_)) => transient = Some(e),
+                Err(e) => return Err(e.into()),
+            }
+            if let Some(e) = transient {
+                if !budget.wait() {
+                    return Err(e.into());
+                }
+            }
         }
         Err(SotError::Store(StoreError::Unavailable(
             "SoT write: too many attempts".into(),
