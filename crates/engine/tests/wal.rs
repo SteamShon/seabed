@@ -306,6 +306,20 @@ impl seabed_ports::ObjectStore for Outage {
     }
 }
 
+/// Runs `f` on its own thread and fails the test if it does not finish in time, so a lost
+/// wake-up or a deadlock shows up as a failure instead of a hung test run.
+fn within<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)));
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(20)) {
+        Ok(Ok(v)) => v,
+        Ok(Err(panic)) => std::panic::resume_unwind(panic),
+        Err(_) => panic!("timed out: an append never returned"),
+    }
+}
+
 fn outage_wal(store: &Arc<Outage>) -> Wal<Outage> {
     Wal::new(store.clone(), keys())
         .unwrap()
@@ -430,6 +444,10 @@ fn retry_does_not_claim_another_writers_entry_with_the_same_request_id() {
 /// LSN) keeps them from appending twice.
 #[test]
 fn concurrent_retries_of_one_request_append_it_once() {
+    within(concurrent_retries_of_one_request_append_it_once_body);
+}
+
+fn concurrent_retries_of_one_request_append_it_once_body() {
     for round in 0..100 {
         let store = Outage::new(round % 2 == 0);
         let wal = outage_wal(&store);
@@ -454,6 +472,10 @@ fn concurrent_retries_of_one_request_append_it_once() {
 /// remembered as landed, and a further retry returns the same LSN without appending.
 #[test]
 fn only_requests_that_ended_unknown_are_remembered() {
+    within(only_requests_that_ended_unknown_are_remembered_body);
+}
+
+fn only_requests_that_ended_unknown_are_remembered_body() {
     // Every put lands but loses its response; read-backs work, so each append resolves its
     // outcome within the call.
     let flaky = Arc::new(FaultInjecting::new(
@@ -476,6 +498,8 @@ fn only_requests_that_ended_unknown_are_remembered() {
     store.recover();
     assert_eq!(wal.append(1, b"x").unwrap(), Lsn::new(1));
     assert_eq!(wal.pending_len(), 1, "remembered as landed");
+    assert_eq!(wal.append(1, b"x").unwrap(), Lsn::new(1));
+    // Answered from memory; that must not leave the id marked in progress either.
     assert_eq!(wal.append(1, b"x").unwrap(), Lsn::new(1));
     assert_eq!(wal.append(2, b"y").unwrap(), Lsn::new(2));
     assert_eq!(wal.pending_len(), 1, "a plain success is not remembered");
@@ -500,6 +524,10 @@ fn a_retry_that_fails_again_keeps_its_candidates() {
 /// candidate no longer points at it), not append a third copy.
 #[test]
 fn retries_after_the_candidate_was_taken_return_the_new_lsn() {
+    within(retries_after_the_candidate_was_taken_return_the_new_lsn_body);
+}
+
+fn retries_after_the_candidate_was_taken_return_the_new_lsn_body() {
     let store = Outage::new(false);
     let wal = outage_wal(&store);
     assert!(wal.append(1, b"x").is_err());
@@ -521,4 +549,137 @@ fn retries_after_the_candidate_was_taken_return_the_new_lsn() {
     });
     assert_eq!(lsns, [Lsn::new(2), Lsn::new(2)]);
     assert_eq!(wal.read_from(Lsn::new(1)).unwrap().len(), 2);
+}
+
+/// Like `Outage`, plus instrumented WAL reads once recovered: each read is held for `hold` and
+/// the number of reads in flight at once is recorded, and a read of LSN 1 can be held until the
+/// test releases it.
+struct Probe {
+    outage: Arc<Outage>,
+    hold: std::time::Duration,
+    in_flight: std::sync::atomic::AtomicUsize,
+    max_in_flight: std::sync::atomic::AtomicUsize,
+    gate: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+}
+
+impl Probe {
+    fn new(hold: std::time::Duration) -> Arc<Self> {
+        Arc::new(Self {
+            outage: Outage::new(true),
+            hold,
+            in_flight: Default::default(),
+            max_in_flight: Default::default(),
+            gate: Default::default(),
+        })
+    }
+}
+
+impl seabed_ports::ObjectStore for Probe {
+    fn caps(&self) -> seabed_ports::ObjectStoreCaps {
+        self.outage.caps()
+    }
+    fn get(&self, key: &seabed_domain::Key) -> Result<(Vec<u8>, seabed_domain::ETag), StoreError> {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.outage.is_down() {
+            return self.outage.get(key);
+        }
+        if *key == keys().wal_key(Lsn::new(1)) {
+            let gate = self.gate.lock().unwrap().take();
+            if let Some(rx) = gate {
+                let _ = rx.recv();
+            }
+        }
+        let now = self.in_flight.fetch_add(1, SeqCst) + 1;
+        self.max_in_flight.fetch_max(now, SeqCst);
+        thread::sleep(self.hold);
+        let r = self.outage.get(key);
+        self.in_flight.fetch_sub(1, SeqCst);
+        r
+    }
+    fn get_range(
+        &self,
+        key: &seabed_domain::Key,
+        range: std::ops::Range<u64>,
+    ) -> Result<Vec<u8>, StoreError> {
+        self.outage.get_range(key, range)
+    }
+    fn put(
+        &self,
+        key: &seabed_domain::Key,
+        data: Vec<u8>,
+        cond: seabed_ports::PutCondition,
+    ) -> Result<seabed_domain::ETag, StoreError> {
+        self.outage.put(key, data, cond)
+    }
+    fn list(&self, prefix: &str) -> Result<Vec<seabed_ports::ObjectMeta>, StoreError> {
+        self.outage.list(prefix)
+    }
+    fn delete(&self, key: &seabed_domain::Key) -> Result<(), StoreError> {
+        self.outage.delete(key)
+    }
+}
+
+fn probe_wal(store: &Arc<Probe>) -> Wal<Probe> {
+    Wal::new(store.clone(), keys())
+        .unwrap()
+        .with_retry_policy(RetryPolicy::immediate(1))
+        .with_write_retry_policy(RetryPolicy::immediate(2))
+}
+
+/// Deterministic check of the one-at-a-time rule: two threads retry the same request together,
+/// and each read of the candidate is held long enough that unserialized retries would overlap.
+/// Reads never overlap (the second retry is answered from memory).
+#[test]
+fn same_id_retries_never_reach_the_store_together() {
+    within(|| {
+        let store = Probe::new(std::time::Duration::from_millis(200));
+        let wal = probe_wal(&store);
+        assert!(wal.append(1, b"x").is_err());
+        store.outage.recover();
+        let barrier = std::sync::Barrier::new(2);
+        let lsns: Vec<Lsn> = thread::scope(|sc| {
+            let hs: Vec<_> = (0..2)
+                .map(|_| {
+                    sc.spawn(|| {
+                        barrier.wait();
+                        wal.append(1, b"x").unwrap()
+                    })
+                })
+                .collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert_eq!(lsns, [Lsn::new(1), Lsn::new(1)]);
+        assert_eq!(
+            store
+                .max_in_flight
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    });
+}
+
+/// The one-at-a-time rule is per request id: while one request's retry is stuck reading its
+/// candidate, an append with another id goes through.
+#[test]
+fn appends_with_other_ids_are_not_blocked() {
+    within(|| {
+        let store = Probe::new(std::time::Duration::ZERO);
+        let wal = Arc::new(probe_wal(&store));
+        assert!(wal.append(1, b"x").is_err());
+        store.outage.recover();
+        let (release, gate) = std::sync::mpsc::channel();
+        *store.gate.lock().unwrap() = Some(gate);
+
+        let stuck = {
+            let wal = wal.clone();
+            thread::spawn(move || wal.append(1, b"x").unwrap())
+        };
+        // Wait until the retry of 1 holds the read of its candidate.
+        while store.gate.lock().unwrap().is_some() {
+            thread::yield_now();
+        }
+        assert_eq!(wal.append(2, b"y").unwrap(), Lsn::new(2));
+        release.send(()).unwrap();
+        assert_eq!(stuck.join().unwrap(), Lsn::new(1));
+    });
 }

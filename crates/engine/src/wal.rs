@@ -14,6 +14,10 @@
 //! `append` returns the last `Store(Unavailable)` error: the entry may or may not have been
 //! appended.
 //!
+//! A `request_id` names one logical request: the caller picks a fresh id for each new request
+//! and reuses it only to retry that request with the same payload. The same id and payload are
+//! treated as the same request.
+//!
 //! Retrying such an append with the same `request_id` and payload on the same `Wal` does not
 //! duplicate it: the `Wal` remembers the LSNs whose outcome was unknown and reads them back
 //! before trying a new one. A candidate counts as this append only if it holds exactly this
@@ -29,9 +33,11 @@
 //!
 //! Not implemented yet (see the design doc): group commit, writer fencing (epochs), durable
 //! deduplication of retries across processes, and handling of a request that is still in flight
-//! after the writer gave up on it (its put may land after the read-back found nothing).
+//! after the writer gave up on it (its put may land after the read-back found nothing). Fencing
+//! must also revisit the retry memory: a remembered landed LSN is answered without reading the
+//! store, which stays right only while an LSN keeps one meaning.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
@@ -136,10 +142,10 @@ struct Pending {
 /// Request id to `Pending`, holding at most `MAX_PENDING`, forgetting the least recently set.
 #[derive(Default)]
 struct PendingMap {
+    /// Request id to (generation of its last `set`, what is known).
     map: HashMap<u64, (u64, Pending)>,
-    /// (request id, generation) in the order they were set. Entries whose generation no longer
-    /// matches the map are stale and skipped.
-    order: VecDeque<(u64, u64)>,
+    /// Generation to request id, one per entry of `map`: the first is the least recently set.
+    order: BTreeMap<u64, u64>,
     generation: u64,
 }
 
@@ -150,30 +156,49 @@ impl PendingMap {
 
     fn set(&mut self, id: u64, pending: Pending) {
         self.generation += 1;
-        self.map.insert(id, (self.generation, pending));
-        self.order.push_back((id, self.generation));
+        if let Some((old, _)) = self.map.insert(id, (self.generation, pending)) {
+            self.order.remove(&old);
+        }
+        self.order.insert(self.generation, id);
         while self.map.len() > MAX_PENDING {
-            let Some((old, generation)) = self.order.pop_front() else {
+            let Some((_, oldest)) = self.order.pop_first() else {
                 break;
             };
-            if self.map.get(&old).is_some_and(|(g, _)| *g == generation) {
-                self.map.remove(&old);
-            }
-        }
-        // Keep the queue proportional to the map even when entries are replaced or removed.
-        if self.order.len() > 2 * MAX_PENDING {
-            let map = &self.map;
-            self.order
-                .retain(|(id, g)| map.get(id).is_some_and(|(cur, _)| cur == g));
+            self.map.remove(&oldest);
         }
     }
 
     fn remove(&mut self, id: u64) {
-        self.map.remove(&id);
+        if let Some((generation, _)) = self.map.remove(&id) {
+            self.order.remove(&generation);
+        }
     }
 
     fn len(&self) -> usize {
         self.map.len()
+    }
+}
+
+/// What to do with the retry memory of a request once its `append` returns.
+#[derive(Debug, PartialEq, Eq)]
+enum Record {
+    Set(Outcome),
+    Remove,
+    Nothing,
+}
+
+/// Decides how an `append` updates the retry memory. `retrying`: the request was remembered when
+/// the call started. `unresolved`: the LSNs whose outcome is still unknown when it returned.
+fn record(retrying: bool, result: &Result<Lsn, WalError>, unresolved: &[u64]) -> Record {
+    match result {
+        // A retry found or made its entry: answer later retries with this LSN.
+        Ok(lsn) if retrying => Record::Set(Outcome::Landed(*lsn)),
+        // A first attempt whose outcome is known: nothing to remember.
+        Ok(_) => Record::Nothing,
+        Err(_) if !unresolved.is_empty() => Record::Set(Outcome::Unknown(unresolved.to_vec())),
+        // Every earlier candidate turned out not to be ours: nothing is unknown any more.
+        Err(_) if retrying => Record::Remove,
+        Err(_) => Record::Nothing,
     }
 }
 
@@ -271,25 +296,13 @@ impl<S: ObjectStore> Wal<S> {
         let result = self.append_entry(&entry, &mut unresolved);
 
         let mut retries = self.lock_retries();
-        match &result {
-            Ok(lsn) if retrying => retries.pending.set(
-                request_id,
-                Pending {
-                    digest,
-                    outcome: Outcome::Landed(*lsn),
-                },
-            ),
-            Ok(_) => {}
-            Err(_) if !unresolved.is_empty() => retries.pending.set(
-                request_id,
-                Pending {
-                    digest,
-                    outcome: Outcome::Unknown(unresolved),
-                },
-            ),
-            // Every earlier candidate turned out not to be ours: nothing is unknown any more.
-            Err(_) => retries.pending.remove(request_id),
+        match record(retrying, &result, &unresolved) {
+            Record::Set(outcome) => retries.pending.set(request_id, Pending { digest, outcome }),
+            Record::Remove => retries.pending.remove(request_id),
+            Record::Nothing => {}
         }
+        // Release the lock before `_done` clears the in-progress mark, which locks it again.
+        drop(retries);
         result
     }
 
@@ -445,13 +458,39 @@ mod tests {
     }
 
     #[test]
-    fn pending_map_queue_stays_bounded_under_churn() {
+    fn pending_map_order_tracks_the_map_exactly() {
         let mut m = PendingMap::default();
         for round in 0..10 * MAX_PENDING as u64 {
             m.set(round % 3, unknown(round));
-            m.remove(round % 3);
+            if round % 2 == 0 {
+                m.remove(round % 3);
+            }
+            assert_eq!(m.order.len(), m.map.len());
         }
-        assert_eq!(m.len(), 0);
-        assert!(m.order.len() <= 2 * MAX_PENDING + 1);
+    }
+
+    #[test]
+    fn record_decides_what_to_remember() {
+        let ok = Ok(Lsn::new(5));
+        let err = Err(WalError::TooManyAttempts);
+        assert_eq!(
+            record(true, &ok, &[]),
+            Record::Set(Outcome::Landed(Lsn::new(5)))
+        );
+        assert_eq!(
+            record(false, &ok, &[3]),
+            Record::Nothing,
+            "known in the call"
+        );
+        assert_eq!(
+            record(false, &err, &[3]),
+            Record::Set(Outcome::Unknown(vec![3]))
+        );
+        assert_eq!(
+            record(true, &err, &[3, 4]),
+            Record::Set(Outcome::Unknown(vec![3, 4]))
+        );
+        assert_eq!(record(true, &err, &[]), Record::Remove, "no longer unknown");
+        assert_eq!(record(false, &err, &[]), Record::Nothing);
     }
 }
