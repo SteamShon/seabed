@@ -330,16 +330,10 @@ fn racing_flushes_of_the_same_range_commit_once_and_leave_no_divergent_files() {
         .iter()
         .filter_map(|r| r.as_ref().ok().and_then(|f| f.as_ref()).map(|f| f.version))
         .collect();
+    // None of them fails: identical content means a shared commit id (more than one may report
+    // success), and a flush that starts after the commit finds nothing left to flush.
     for r in &results {
-        assert!(
-            matches!(
-                r,
-                Ok(Some(_))
-                    | Ok(None)
-                    | Err(NamespaceError::Manifest(ManifestError::CommitConflict))
-            ),
-            "unexpected {r:?}"
-        );
+        assert!(matches!(r, Ok(Some(_)) | Ok(None)), "unexpected {r:?}");
     }
     assert_eq!(
         versions.len(),
@@ -921,4 +915,61 @@ fn write_retry_policy_applies_to_manifest_commits_and_sot_writes() {
         Err(NamespaceError::Sot(SotError::Store(unavailable())))
     );
     assert_eq!(puts.load(SeqCst), 4);
+}
+
+/// Two writers add the same attribute type from the same manifest version. Their widened
+/// contents are identical, so they share a commit id: the one that loses the create reads the
+/// winner's version back, takes it as its own commit and appends at once, without reloading.
+/// One schema version, two appends.
+#[test]
+fn same_type_schema_race_both_writers_succeed_with_one_version() {
+    let mem = Arc::new(MemObjectStore::new());
+    ns(&mem)
+        .write(
+            1,
+            &[Op::upsert("seed", vec![]).with_attr("price", price(1))],
+        )
+        .unwrap();
+    let (base, _) = latest_manifest(&mem);
+
+    let hooked = Hooked::new(&mem);
+    let loser = Namespace::new(hooked.clone(), keys(), DIMS).unwrap();
+    let ran = Arc::new(AtomicBool::new(false));
+    let (mem2, ran2) = (mem.clone(), ran.clone());
+    hooked.on_put(move |key| {
+        if is_manifest_version(key) && !ran2.swap(true, SeqCst) {
+            ns(&mem2)
+                .write(
+                    2,
+                    &[Op::upsert("w", vec![]).with_attr("size", AttrValue::Str("m".into()))],
+                )
+                .unwrap();
+        }
+        PutAction::Pass
+    });
+    let version_gets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gets = version_gets.clone();
+    hooked.on_get(move |key| {
+        if is_manifest_version(key) {
+            gets.fetch_add(1, SeqCst);
+        }
+    });
+    loser
+        .write(
+            3,
+            &[Op::upsert("l", vec![]).with_attr("size", AttrValue::Str("s".into()))],
+        )
+        .unwrap();
+    assert!(ran.load(SeqCst), "the race happened");
+
+    assert_eq!(
+        latest_manifest(&mem).0.get(),
+        base.get() + 1,
+        "one schema version"
+    );
+    assert_eq!(wal_entries(&mem), 3, "seed, winner, loser");
+    // Load (version + probe for a newer one), the successor check of the commit (the expected
+    // version again) and one read-back of the winner's version. A loser that took it for a
+    // conflict would reload: two more version GETs.
+    assert_eq!(version_gets.load(SeqCst), 4);
 }

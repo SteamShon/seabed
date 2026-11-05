@@ -647,8 +647,9 @@ fn concurrent_commit_content_with_faults_keeps_successor_rules() {
             .with_write_retry_policy(RetryPolicy::immediate(64))
         };
         let ms = store_for(seed * 1000);
-        // Even a lone writer can see an injected 409 (`CommitConflict`); the contract is to
-        // reload and retry.
+        // An injected 409 leaves no object, so `commit` reads nothing back and tries again; only
+        // a 409 on every try of the write budget surfaces as `CommitConflict`. The contract is
+        // still to reload and retry.
         let mut id = 0;
         while ms.load_latest().unwrap().is_none() {
             id += 1;

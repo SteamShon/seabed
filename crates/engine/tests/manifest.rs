@@ -511,3 +511,112 @@ fn pointer_put_failures_stop_early_and_the_commit_still_succeeds() {
         1
     );
 }
+
+/// Refuses the first `refusals` version creates with a 409 that leaves no object behind, and
+/// counts requests to version keys only.
+struct RefuseVersions {
+    inner: MemObjectStore,
+    refusals: std::sync::atomic::AtomicUsize,
+    version_puts: std::sync::atomic::AtomicUsize,
+    version_gets: std::sync::atomic::AtomicUsize,
+}
+
+impl RefuseVersions {
+    fn new(refusals: usize) -> Arc<Self> {
+        Arc::new(Self {
+            inner: MemObjectStore::new(),
+            refusals: refusals.into(),
+            version_puts: Default::default(),
+            version_gets: Default::default(),
+        })
+    }
+    fn counts(&self) -> (usize, usize) {
+        use std::sync::atomic::Ordering::SeqCst;
+        (
+            self.version_puts.load(SeqCst),
+            self.version_gets.load(SeqCst),
+        )
+    }
+}
+
+impl ObjectStore for RefuseVersions {
+    fn caps(&self) -> ObjectStoreCaps {
+        self.inner.caps()
+    }
+    fn get(&self, key: &Key) -> Result<(Vec<u8>, ETag), StoreError> {
+        if keys().parse_manifest_version(key).is_some() {
+            self.version_gets
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        self.inner.get(key)
+    }
+    fn get_range(&self, key: &Key, range: Range<u64>) -> Result<Vec<u8>, StoreError> {
+        self.inner.get_range(key, range)
+    }
+    fn put(&self, key: &Key, data: Vec<u8>, cond: PutCondition) -> Result<ETag, StoreError> {
+        use std::sync::atomic::Ordering::SeqCst;
+        if keys().parse_manifest_version(key).is_some() {
+            self.version_puts.fetch_add(1, SeqCst);
+            let refuse = self
+                .refusals
+                .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1))
+                .is_ok();
+            if refuse {
+                return Err(StoreError::Conflict);
+            }
+        }
+        self.inner.put(key, data, cond)
+    }
+    fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>, StoreError> {
+        self.inner.list(prefix)
+    }
+    fn delete(&self, key: &Key) -> Result<(), StoreError> {
+        self.inner.delete(key)
+    }
+}
+
+/// A 409 that left nothing behind is not someone else's commit: after reading the key back and
+/// finding nothing, `commit` tries again and succeeds.
+#[test]
+fn a_refused_put_with_nothing_behind_it_is_retried() {
+    let store = RefuseVersions::new(1);
+    let ms = ManifestStore::new(store.clone(), keys())
+        .unwrap()
+        .with_write_retry_policy(RetryPolicy::immediate(3));
+    assert_eq!(ms.commit(None, 1, b"first").unwrap(), Version::new(1));
+    // Refused put, read-back (nothing), put again.
+    assert_eq!(store.counts(), (2, 1));
+}
+
+/// When such refusals never stop, they cost the write budget (with backoff) and end in
+/// `CommitConflict`, instead of spinning up to the attempt limit without a pause.
+#[test]
+fn endless_refusals_with_nothing_behind_them_stop_at_the_write_budget() {
+    let store = RefuseVersions::new(usize::MAX);
+    let ms = ManifestStore::new(store.clone(), keys())
+        .unwrap()
+        .with_write_retry_policy(RetryPolicy::immediate(3));
+    assert_eq!(
+        ms.commit(None, 1, b"first"),
+        Err(ManifestError::CommitConflict)
+    );
+    assert_eq!(store.counts(), (3, 3));
+}
+
+/// Losing a clean race costs one read-back, which finds the other writer's commit id.
+#[test]
+fn a_clean_conflict_costs_one_read_back() {
+    let mem = Arc::new(MemObjectStore::new());
+    ManifestStore::new(mem.clone(), keys())
+        .unwrap()
+        .commit(None, 1, b"winner")
+        .unwrap();
+    let counting = Arc::new(CountingObjectStore::new(mem));
+    let loser = ManifestStore::new(counting.clone(), keys()).unwrap();
+    assert_eq!(
+        loser.commit(None, 2, b"loser"),
+        Err(ManifestError::CommitConflict)
+    );
+    let s = counting.stats();
+    assert_eq!((s.puts, s.gets, s.lists), (1, 1, 0));
+}

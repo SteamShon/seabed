@@ -48,6 +48,9 @@ pub struct Manifest {
     pub payload: Vec<u8>,
 }
 
+/// Tries for the best-effort pointer advance after a commit (capped by the write policy).
+pub const POINTER_RETRY_ATTEMPTS: usize = 2;
+
 /// The store is always wrapped in `Retrying`, so transient read failures (`get`, `list`) are
 /// retried with backoff without the caller having to remember it. Writes are not retried by the
 /// wrapper: `commit` resolves ambiguous put outcomes itself. Pass a `RetryPolicy` with
@@ -64,9 +67,10 @@ pub struct Manifest {
 /// Advancing the pointer after a commit is best effort and gets at most
 /// `POINTER_RETRY_ATTEMPTS` tries of the same policy, so an already committed version is not
 /// held up by a pointer that cannot be written.
-/// Tries for the best-effort pointer advance after a commit (capped by the write policy).
-pub const POINTER_RETRY_ATTEMPTS: usize = 2;
-
+///
+/// A create refused while nothing can be read at the key yet (a 409 that left no object, or a
+/// store that lists the key before serving it) is retried under the same budget, with backoff;
+/// when the budget runs out `commit` reports `CommitConflict`, so the caller reloads.
 pub struct ManifestStore<S: ObjectStore> {
     store: Retrying<Arc<S>>,
     keys: NamespaceKeys,
@@ -310,6 +314,9 @@ impl<S: ObjectStore> ManifestStore<S> {
             }
             if let Some(e) = transient {
                 budget.retry_or(e)?;
+            } else if rejected {
+                // Refused, yet nothing is there to compare: try again after a backoff.
+                budget.retry_or(ManifestError::CommitConflict)?;
             }
         }
         Err(ManifestError::TooManyAttempts)
