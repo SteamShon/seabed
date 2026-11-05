@@ -283,9 +283,15 @@ impl<S: ObjectStore> Namespace<S> {
     /// its new attributes in the schema: their types stay reserved.
     ///
     /// `Wal(Store(Unavailable))` means the write retry budget ran out with the append's outcome
-    /// unknown: the batch may or may not be in the WAL. The WAL does not yet recognise a retried
-    /// `request_id` across calls, so retrying may append the batch twice (harmless for a lone
-    /// writer; another writer's update to the same ids in between would be overwritten).
+    /// unknown: the batch may or may not be in the WAL. `request_id` names one logical write:
+    /// use a fresh one for each new write, and reuse it only to retry that write with the same
+    /// ops (the same id and ops count as the same write). Retrying the same batch with the same
+    /// `request_id` on the same `Namespace` is safe, also from several threads at once: the WAL
+    /// checks where the earlier attempt may have landed and returns that LSN if it did (batches
+    /// encode deterministically, and only an identical entry counts as this batch). A retry
+    /// from another process or `Namespace`, or after a restart, may still append the batch twice
+    /// (harmless for a lone writer; another writer's update to the same ids in between would be
+    /// overwritten).
     /// `Manifest(Store(Unavailable))` means the same for the schema commit before the append:
     /// nothing was appended, and retrying is safe (the commit id comes from the content, and a
     /// reload finds the widened schema if that commit landed).
