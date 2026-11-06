@@ -25,7 +25,14 @@ use crate::manifest_content::{ContentError, ManifestContent};
 pub enum ManifestError {
     Store(StoreError),
     Unsupported(&'static str),
-    /// Another writer committed first (or `expected` was stale). Reload and retry.
+    /// The version after `expected` could not be created as this commit. Reload and retry.
+    ///
+    /// Usually another writer committed first (or `expected` was stale). It is also returned when
+    /// the write budget runs out on creates that were refused while nothing could be read at the
+    /// key (a 409 that left no object, or a store that does not serve the key yet). If an
+    /// earlier try in that same call ended `Unavailable`, that try may have landed: the version
+    /// may then hold this very commit. Callers that commit again with the same `expected` and
+    /// `commit_id` find out (the commit is recognised by its id); callers that reload see it.
     CommitConflict,
     Corrupt(Version),
     /// The pointer object does not hold an 8-byte version.
@@ -74,6 +81,9 @@ pub const POINTER_RETRY_ATTEMPTS: usize = 2;
 pub struct ManifestStore<S: ObjectStore> {
     store: Retrying<Arc<S>>,
     keys: NamespaceKeys,
+    /// Safety cap on loop rounds. In `advance_pointer` it bounds lost races, which cost no
+    /// budget. In `create_version` every round that does not return spends one try of the write
+    /// budget, so the cap only matters for a write policy with more tries than this.
     max_attempts: usize,
     write_policy: RetryPolicy,
 }

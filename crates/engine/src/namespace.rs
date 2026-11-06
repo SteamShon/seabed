@@ -56,6 +56,12 @@ pub enum NamespaceError {
         lsn: Lsn,
         reason: String,
     },
+    /// `write` could not commit the schema extension its batch needs: every one of its
+    /// `SCHEMA_COMMIT_ATTEMPTS` (32) tries ended in `CommitConflict`. Nothing was appended, and
+    /// the batch may be retried later. Either other manifest commits kept landing first, or the
+    /// store kept refusing the create with nothing behind it, in which case each try already
+    /// spent a full write budget (see `Namespace::write`).
+    SchemaCommitContention,
 }
 
 impl From<WalError> for NamespaceError {
@@ -295,6 +301,15 @@ impl<S: ObjectStore> Namespace<S> {
     /// `Manifest(Store(Unavailable))` means the same for the schema commit before the append:
     /// nothing was appended, and retrying is safe (the commit id comes from the content, and a
     /// reload finds the widened schema if that commit landed).
+    ///
+    /// `SchemaCommitContention` means the schema commit lost every one of its 32 tries; nothing
+    /// was appended. A lost race ends a try quickly. A store that keeps refusing the create with
+    /// nothing behind it (a 409 that leaves no object) makes each try spend a whole write budget
+    /// first. With the default policy that is about 2.3 s of backoff sleep per try (up to twice
+    /// that with jitter), so such a write sleeps about 72 s in total (up to about 145 s) before
+    /// it returns, plus the time of its requests: each try makes up to 8 creates and 8
+    /// read-backs, and reloads the manifest, about 600 requests over 32 tries. Pass a smaller
+    /// policy with `with_write_retry_policy` to fail faster.
     pub fn write(&self, request_id: u64, ops: &[Op]) -> Result<Lsn, NamespaceError> {
         if ops.is_empty() {
             return Err(NamespaceError::Invalid(SotError::Format(
@@ -331,7 +346,7 @@ impl<S: ObjectStore> Namespace<S> {
             // The schema only grows, so the batch stays valid against every later schema.
             return Ok(self.wal.append(request_id, &encode_record(ops))?);
         }
-        Err(NamespaceError::Manifest(ManifestError::TooManyAttempts))
+        Err(NamespaceError::SchemaCommitContention)
     }
 
     /// Moves the WAL tail into a new segment. Returns `None` when there is nothing to flush.

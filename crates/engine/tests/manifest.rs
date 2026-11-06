@@ -3,6 +3,8 @@ use std::sync::Arc;
 use std::thread;
 
 use std::ops::Range;
+use std::sync::atomic::Ordering::SeqCst;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 
 use seabed_adapter_objectstore_mem::{
     CountingObjectStore, FaultConfig, FaultInjecting, MemObjectStore,
@@ -266,33 +268,53 @@ fn malformed_pointer_is_reported_as_corrupt() {
     assert_eq!(ms.load_latest().unwrap_err(), ManifestError::CorruptPointer);
 }
 
-/// Scripts the one sequence that reaches `create_version`'s "maybe landed" branch:
-/// 1. the first put is applied but its response is lost (`Unavailable`),
-/// 2. the confirming GET fails too, so the outcome is still unknown,
-/// 3. the retried put is rejected because our own first attempt already created the object,
-/// 4. the next confirming GET succeeds and shows the object is ours.
-///
-/// The writer must report success, not a conflict with itself.
-///
-/// Faults and counters apply only to the version-1 manifest key, so pointer traffic or a
-/// change in call order cannot shift the script onto another request.
-struct LostThenRejected {
+/// Scripted faults on manifest version keys (pointer traffic passes through untouched), with
+/// counters for requests to version keys:
+/// - `lose_first_put`: the first version put is applied but its response is lost (`Unavailable`);
+/// - `fail_first_get`: the first version GET fails with `Unavailable`;
+/// - `stale`: while set, version GETs report `NotFound` (a store that has the key but does not
+///   serve it yet).
+struct ScriptedVersions {
     inner: MemObjectStore,
-    target: Key,
-    puts: std::sync::atomic::AtomicUsize,
-    gets: std::sync::atomic::AtomicUsize,
+    lose_first_put: AtomicBool,
+    fail_first_get: AtomicBool,
+    stale: AtomicBool,
+    puts: AtomicUsize,
+    gets: AtomicUsize,
 }
 
-impl ObjectStore for LostThenRejected {
+impl ScriptedVersions {
+    fn new() -> Self {
+        Self {
+            inner: MemObjectStore::new(),
+            lose_first_put: false.into(),
+            fail_first_get: false.into(),
+            stale: false.into(),
+            puts: Default::default(),
+            gets: Default::default(),
+        }
+    }
+    /// (version puts, version GETs) so far.
+    fn counts(&self) -> (usize, usize) {
+        (self.puts.load(SeqCst), self.gets.load(SeqCst))
+    }
+}
+
+impl ObjectStore for ScriptedVersions {
     fn caps(&self) -> ObjectStoreCaps {
         self.inner.caps()
     }
     fn get(&self, key: &Key) -> Result<(Vec<u8>, ETag), StoreError> {
-        use std::sync::atomic::Ordering::SeqCst;
-        if *key == self.target && self.gets.fetch_add(1, SeqCst) == 0 {
-            return Err(StoreError::Unavailable(
-                "scripted: confirm GET fails".into(),
-            ));
+        if keys().parse_manifest_version(key).is_some() {
+            self.gets.fetch_add(1, SeqCst);
+            if self.fail_first_get.swap(false, SeqCst) {
+                return Err(StoreError::Unavailable(
+                    "scripted: confirm GET fails".into(),
+                ));
+            }
+            if self.stale.load(SeqCst) {
+                return Err(StoreError::NotFound);
+            }
         }
         self.inner.get(key)
     }
@@ -300,11 +322,13 @@ impl ObjectStore for LostThenRejected {
         self.inner.get_range(key, range)
     }
     fn put(&self, key: &Key, data: Vec<u8>, cond: PutCondition) -> Result<ETag, StoreError> {
-        use std::sync::atomic::Ordering::SeqCst;
         let result = self.inner.put(key, data, cond);
-        if *key == self.target && self.puts.fetch_add(1, SeqCst) == 0 {
-            assert!(result.is_ok());
-            return Err(StoreError::Unavailable("scripted: response lost".into()));
+        if keys().parse_manifest_version(key).is_some() {
+            self.puts.fetch_add(1, SeqCst);
+            if self.lose_first_put.swap(false, SeqCst) {
+                assert!(result.is_ok(), "the lost put must have been applied");
+                return Err(StoreError::Unavailable("scripted: response lost".into()));
+            }
         }
         result
     }
@@ -316,14 +340,18 @@ impl ObjectStore for LostThenRejected {
     }
 }
 
+/// Scripts the one sequence that reaches `create_version`'s "maybe landed" branch:
+/// 1. the first put is applied but its response is lost (`Unavailable`),
+/// 2. the confirming GET fails too, so the outcome is still unknown,
+/// 3. the retried put is rejected because our own first attempt already created the object,
+/// 4. the next confirming GET succeeds and shows the object is ours.
+///
+/// The writer must report success, not a conflict with itself.
 #[test]
 fn own_commit_is_recognised_after_lost_response_then_precondition_failed() {
-    let store = Arc::new(LostThenRejected {
-        inner: MemObjectStore::new(),
-        target: keys().manifest_key(Version::new(1)),
-        puts: Default::default(),
-        gets: Default::default(),
-    });
+    let store = Arc::new(ScriptedVersions::new());
+    store.lose_first_put.store(true, SeqCst);
+    store.fail_first_get.store(true, SeqCst);
     // No read retries, so the scripted GET failure is seen by `commit` itself.
     let ms = ManifestStore::new(store.clone(), keys())
         .unwrap()
@@ -332,9 +360,7 @@ fn own_commit_is_recognised_after_lost_response_then_precondition_failed() {
     assert_eq!(ms.commit(None, 77, b"mine").unwrap(), Version::new(1));
     // Exactly the scripted path, counted before the reads below add their own GET:
     // lost put, failed confirm, rejected retry, good confirm.
-    use std::sync::atomic::Ordering::SeqCst;
-    assert_eq!(store.puts.load(SeqCst), 2, "manifest puts");
-    assert_eq!(store.gets.load(SeqCst), 2, "manifest confirm GETs");
+    assert_eq!(store.counts(), (2, 2), "version puts and confirm GETs");
 
     let latest = ms.load_latest().unwrap().unwrap();
     assert_eq!(latest.version, Version::new(1), "no duplicate version");
@@ -619,36 +645,66 @@ fn a_clean_conflict_costs_one_read_back() {
     assert_eq!((s.puts, s.gets, s.lists), (1, 1, 0));
 }
 
-/// Serves version objects as missing while `stale` is set (a store that has a key but does not
-/// serve it yet), and reports the first version put as lost after applying it.
-struct LostThenStale {
-    inner: MemObjectStore,
-    stale: std::sync::atomic::AtomicBool,
-    lost_first: std::sync::atomic::AtomicBool,
+/// The first create lands but its response is lost; later tries are refused while the store
+/// does not serve the key yet. When the budget runs out the result is `CommitConflict` (the
+/// caller reloads), even though the commit is ours; once the key is served, committing again
+/// recognises it.
+#[test]
+fn unavailable_then_stale_refusals_report_conflict_and_a_retry_recognises_the_commit() {
+    let store = Arc::new(ScriptedVersions::new());
+    store.lose_first_put.store(true, SeqCst);
+    store.stale.store(true, SeqCst);
+    let ms = ManifestStore::new(store.clone(), keys())
+        .unwrap()
+        .with_write_retry_policy(RetryPolicy::immediate(3));
+    assert_eq!(
+        ms.commit(None, 7, b"first"),
+        Err(ManifestError::CommitConflict)
+    );
+    // The lost put and the two refusals each cost one try of the budget of 3, and each is
+    // followed by one read-back.
+    assert_eq!(store.counts(), (3, 3));
+
+    store.stale.store(false, SeqCst);
+    assert_eq!(ms.commit(None, 7, b"first").unwrap(), Version::new(1));
 }
 
-impl ObjectStore for LostThenStale {
+/// Before our first pointer put, `race` (if set) makes another writer write that value to the
+/// pointer, and our put is then refused with `refusal`: `PreconditionFailed` (stale `If-Match`
+/// etag) or `Conflict` (a store that answers a lost race with 409). Counts pointer puts, ours
+/// only.
+struct PointerRace {
+    inner: MemObjectStore,
+    race: std::sync::Mutex<Option<u64>>,
+    refusal: StoreError,
+    pointer_puts: AtomicUsize,
+}
+
+impl ObjectStore for PointerRace {
     fn caps(&self) -> ObjectStoreCaps {
         self.inner.caps()
     }
     fn get(&self, key: &Key) -> Result<(Vec<u8>, ETag), StoreError> {
-        use std::sync::atomic::Ordering::SeqCst;
-        if keys().parse_manifest_version(key).is_some() && self.stale.load(SeqCst) {
-            return Err(StoreError::NotFound);
-        }
         self.inner.get(key)
     }
     fn get_range(&self, key: &Key, range: Range<u64>) -> Result<Vec<u8>, StoreError> {
         self.inner.get_range(key, range)
     }
     fn put(&self, key: &Key, data: Vec<u8>, cond: PutCondition) -> Result<ETag, StoreError> {
-        use std::sync::atomic::Ordering::SeqCst;
-        let result = self.inner.put(key, data, cond);
-        if keys().parse_manifest_version(key).is_some() && self.lost_first.swap(false, SeqCst) {
-            result?;
-            return Err(StoreError::Unavailable("response lost".into()));
+        if *key == keys().manifest_pointer_key() {
+            self.pointer_puts.fetch_add(1, SeqCst);
+            if let Some(other) = self.race.lock().unwrap().take() {
+                self.inner
+                    .put(
+                        key,
+                        other.to_le_bytes().to_vec(),
+                        PutCondition::Unconditional,
+                    )
+                    .unwrap();
+                return Err(self.refusal.clone());
+            }
         }
-        result
+        self.inner.put(key, data, cond)
     }
     fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>, StoreError> {
         self.inner.list(prefix)
@@ -658,26 +714,42 @@ impl ObjectStore for LostThenStale {
     }
 }
 
-/// The first create lands but its response is lost; later tries are refused while the store
-/// does not serve the key yet. When the budget runs out the result is `CommitConflict` (the
-/// caller reloads), even though the commit is ours; once the key is served, committing again
-/// recognises it.
+/// A pointer put that loses its race (412 or 409) is not a store failure: the writer re-reads
+/// the pointer and decides again, without spending the write budget (one try here). If the
+/// other writer left the pointer behind this commit, it is moved forward; if it already points
+/// at this commit, nothing more is written.
 #[test]
-fn unavailable_then_stale_refusals_report_conflict_and_a_retry_recognises_the_commit() {
-    use std::sync::atomic::Ordering::SeqCst;
-    let store = Arc::new(LostThenStale {
-        inner: MemObjectStore::new(),
-        stale: true.into(),
-        lost_first: true.into(),
-    });
-    let ms = ManifestStore::new(store.clone(), keys())
-        .unwrap()
-        .with_write_retry_policy(RetryPolicy::immediate(3));
-    assert_eq!(
-        ms.commit(None, 7, b"first"),
-        Err(ManifestError::CommitConflict)
-    );
+fn a_pointer_put_that_loses_a_race_rereads_and_ends_at_the_latest() {
+    let cases = [StoreError::PreconditionFailed, StoreError::Conflict]
+        .into_iter()
+        .flat_map(|refusal| [(refusal.clone(), 1u64, 2usize), (refusal, 2, 1)]);
+    for (refusal, other, puts) in cases {
+        let store = Arc::new(PointerRace {
+            inner: MemObjectStore::new(),
+            race: Default::default(),
+            refusal: refusal.clone(),
+            pointer_puts: Default::default(),
+        });
+        let ms = ManifestStore::new(store.clone(), keys())
+            .unwrap()
+            .with_write_retry_policy(RetryPolicy::immediate(1));
+        ms.commit(None, 1, b"first").unwrap();
+        store.pointer_puts.store(0, SeqCst);
 
-    store.stale.store(false, SeqCst);
-    assert_eq!(ms.commit(None, 7, b"first").unwrap(), Version::new(1));
+        *store.race.lock().unwrap() = Some(other);
+        assert_eq!(
+            ms.commit(Some(Version::new(1)), 2, b"second").unwrap(),
+            Version::new(2)
+        );
+        assert_eq!(
+            pointer_value(&store.inner),
+            Some(2),
+            "{refusal:?}, other writer at {other}"
+        );
+        assert_eq!(
+            store.pointer_puts.load(SeqCst),
+            puts,
+            "{refusal:?}, other writer at {other}"
+        );
+    }
 }
