@@ -976,7 +976,8 @@ fn same_type_schema_race_both_writers_succeed_with_one_version() {
 
 /// Every version create is refused with nothing behind it. A write that adds an attribute keeps
 /// reloading after each `CommitConflict`, so its cost is bounded by `SCHEMA_COMMIT_ATTEMPTS`
-/// (32) times the write budget, and it appends nothing.
+/// (32) times the write budget, appends nothing, and reports `SchemaCommitContention` (not a
+/// manifest error: every single commit ended as `CommitConflict`).
 #[test]
 fn endless_empty_refusals_end_a_write_after_bounded_tries() {
     let mem = Arc::new(MemObjectStore::new());
@@ -996,7 +997,7 @@ fn endless_empty_refusals_end_a_write_after_bounded_tries() {
     });
     assert_eq!(
         n.write(1, &[Op::upsert("a", vec![]).with_attr("size", price(1))]),
-        Err(NamespaceError::Manifest(ManifestError::TooManyAttempts))
+        Err(NamespaceError::SchemaCommitContention)
     );
     assert_eq!(puts.load(SeqCst), 32 * 3);
     assert_eq!(wal_entries(&mem), 0);
