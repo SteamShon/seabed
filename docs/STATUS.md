@@ -45,7 +45,7 @@ M0 결과가 "새로 만들지, 기여·재사용할지"를 정하므로, M2 이
 | `Namespace` 쓰기 · flush · strong 읽기(WAL 꼬리 병합) | ✅ | #14 |
 | 쓰기 경로 재시도 예산 | ✅ | #16 |
 | 오류 enum `#[non_exhaustive]`, nightly 장애 주입(시드 1000개) | ✅ #25 릴리스로 기본 브랜치에 들어가 수동·예약 실행 가능. 수동 실행 1회 성공(run 42161199449, 테스트마다 시드 5개, 2026-11-06). 시드 1000개 예약 실행(매일 17:23 UTC)은 아직 관측 전 | #20, #25 |
-| S3 어댑터(`object_store` crate)와 S3 호환 에뮬레이터(moto) conformance, 엔진 왕복 테스트(포인터 생성과 `If-Match` 갱신 포함), 가짜 HTTP 서버로 5xx·연결 끊김·409·range 중 변경·list 페이지 테스트, CI `s3` job | ✅ | #28 |
+| S3 어댑터(`object_store` crate)와 S3 호환 에뮬레이터(moto) conformance, 엔진 왕복 테스트(포인터 생성과 `If-Match` 갱신 포함), 가짜 HTTP 서버로 5xx·연결 끊김·연결 거부·409·range 중 변경·list 페이지 테스트, CI `s3` job | ✅ | #28 |
 | 실제 AWS S3로 conformance와 엔진 왕복 실행 | ⬜ | |
 | SlateDB 어댑터와 conformance 비교 | ⬜ | |
 | 고아 SoT GC, WAL GC, 오래된 manifest 정리 · 체크포인트 | ⬜ | |

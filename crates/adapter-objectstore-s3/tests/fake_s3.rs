@@ -169,6 +169,7 @@ fn server_errors_and_dropped_connections_are_unavailable_and_not_retried() {
         let server = FakeS3::start(move |_| status(code));
         let store = server.store();
         assert_unavailable(store.get(&key()));
+        assert_unavailable(store.put(&key(), b"x".to_vec(), PutCondition::Unconditional));
         assert_unavailable(store.put(&key(), b"x".to_vec(), PutCondition::IfNoneMatch));
         assert_unavailable(store.put(
             &key(),
@@ -178,7 +179,7 @@ fn server_errors_and_dropped_connections_are_unavailable_and_not_retried() {
         assert_unavailable(store.list(""));
         assert_eq!(
             server.requests().len(),
-            4,
+            5,
             "status {code}: the client retried"
         );
     }
@@ -186,13 +187,39 @@ fn server_errors_and_dropped_connections_are_unavailable_and_not_retried() {
     let server = FakeS3::start(|_| Reply::Drop);
     let store = server.store();
     assert_unavailable(store.get(&key()));
+    assert_unavailable(store.put(&key(), b"x".to_vec(), PutCondition::Unconditional));
     assert_unavailable(store.put(&key(), b"x".to_vec(), PutCondition::IfNoneMatch));
     assert_unavailable(store.put(
         &key(),
         b"x".to_vec(),
         PutCondition::IfMatch(ETag::new("\"e\"")),
     ));
-    assert_eq!(server.requests().len(), 3, "dropped: the client retried");
+    assert_eq!(server.requests().len(), 4, "dropped: the client retried");
+}
+
+/// Nothing listening: the request never reached a store, but the adapter cannot tell that
+/// apart from a lost answer, so it is `Unavailable` too.
+#[test]
+fn a_refused_connection_is_unavailable() {
+    let port = {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let builder = AmazonS3Builder::new()
+        .with_endpoint(format!("http://127.0.0.1:{port}"))
+        .with_allow_http(true)
+        .with_bucket_name("seabed-test")
+        .with_region("us-east-1")
+        .with_access_key_id("test")
+        .with_secret_access_key("test");
+    let store = S3ObjectStore::new(builder, DurabilityClass::Ephemeral).unwrap();
+    assert_unavailable(store.get(&key()));
+    assert_unavailable(store.put(
+        &key(),
+        b"x".to_vec(),
+        PutCondition::IfMatch(ETag::new("\"e\"")),
+    ));
+    assert_unavailable(store.list(""));
 }
 
 /// S3 answers 409 when a concurrent conditional write to the same key is in progress. Like a
