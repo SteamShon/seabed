@@ -2,10 +2,12 @@
 //!
 //! The request counts come from `CountingObjectStore` (failed attempts included, because they
 //! are billed), measured per operation on a small run and scaled by the workload. Prices are
-//! inputs: the defaults are AWS S3 Standard list prices and must be checked before a number
-//! goes into a report (PLAN 11장 lists prices as unverified). Transfer inside a region is
-//! free on S3 and is not modelled; neither is anything turbopuffer charges (the baseline is
-//! an input to [`within_budget`]).
+//! inputs: the defaults are AWS S3 Standard list prices (see the constant for where they were
+//! checked). Transfer inside a region is free on S3 and is not modelled; neither is anything
+//! turbopuffer charges (the baseline is an input to [`within_budget`]).
+//!
+//! Storage is billed per GB-month where AWS's GB is 2^30 bytes (its price list puts the
+//! 50 TB tier edge at 51,200 GB), so the model divides stored bytes by 2^30.
 
 use seabed_adapter_objectstore_mem::RequestStats;
 
@@ -18,16 +20,16 @@ pub struct Prices {
     pub get_per_1000: f64,
     /// DELETE requests, per 1,000 (free on S3).
     pub delete_per_1000: f64,
-    /// Storage, per GB-month (GB = 10^9 bytes here; S3 bills GiB, so this is a ~7% low bias
-    /// to correct when the price is checked).
+    /// Storage, per GB-month, GB = 2^30 bytes.
     pub storage_per_gb_month: f64,
     /// Compute, per node-hour.
     pub compute_per_hour: f64,
 }
 
 impl Prices {
-    /// AWS S3 Standard, us-east-1, first 50 TB, as remembered at 2026-11 [확인 필요].
-    /// Compute is 0 until a node type is chosen.
+    /// AWS S3 Standard, us-east-1, first 50 TB. Matched against the AWS Price List API
+    /// (`AmazonS3/current/us-east-1`, published 2026-11-04) in the PR #29 review. Compute is 0
+    /// until a node type is chosen.
     pub const S3_STANDARD_US_EAST_1: Prices = Prices {
         put_list_per_1000: 0.005,
         get_per_1000: 0.0004,
@@ -67,6 +69,8 @@ impl MonthlyCost {
     }
 }
 
+const GIB: f64 = (1u64 << 30) as f64;
+
 /// The price of one batch of requests.
 pub fn request_cost(prices: &Prices, r: &RequestStats) -> f64 {
     (r.puts + r.lists) as f64 * prices.put_list_per_1000 / 1000.0
@@ -79,7 +83,7 @@ pub fn monthly_cost(prices: &Prices, w: &Workload) -> MonthlyCost {
         requests: w.queries_per_month * request_cost(prices, &w.per_query)
             + w.writes_per_month * request_cost(prices, &w.per_write)
             + request_cost(prices, &w.fixed),
-        storage: w.stored_bytes / 1e9 * prices.storage_per_gb_month,
+        storage: w.stored_bytes / GIB * prices.storage_per_gb_month,
         compute: w.compute_hours * prices.compute_per_hour,
     }
 }
@@ -145,7 +149,7 @@ mod tests {
             writes_per_month: 100.0,
             per_write: stats(1, 2, 0, 0), // 0.0004 + 0.01 = 0.0104
             fixed: stats(0, 0, 0, 1000),  // 1.0
-            stored_bytes: 2e9,
+            stored_bytes: 2.0 * GIB,
             compute_hours: 10.0,
         };
         let c = monthly_cost(&P, &w);
@@ -153,6 +157,21 @@ mod tests {
         assert_eq!(c.storage, 46.0);
         assert_eq!(c.compute, 20.0);
         assert!((c.total() - (c.requests + 66.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn storage_is_billed_per_gib() {
+        let w = Workload {
+            stored_bytes: GIB,
+            ..Workload::default()
+        };
+        assert_eq!(monthly_cost(&P, &w).storage, P.storage_per_gb_month);
+        // 10^9 bytes is less than one billed GB.
+        let w = Workload {
+            stored_bytes: 1e9,
+            ..Workload::default()
+        };
+        assert!(monthly_cost(&P, &w).storage < P.storage_per_gb_month * 0.94);
     }
 
     #[test]

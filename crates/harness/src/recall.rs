@@ -1,13 +1,19 @@
 //! recall@k and its summary per selectivity band.
 //!
-//! The M0 criterion (3) is judged on the weakest band: a system that is good on average but
-//! poor for very selective filters fails (PLAN 2장, 3장).
+//! The recall half of the M0 criterion (3) is judged on the weakest band: a system that is
+//! good on average but poor for very selective filters fails (PLAN 2장, 3장). The latency half
+//! (p99 ≤ 1 s) is measured separately.
+//!
+//! A query whose filter keeps no document has nothing to find. It is counted per band but
+//! left out of the recall statistics, so empty filters cannot lift the band the criterion is
+//! judged on.
 
 /// recall@k of one query: the fraction of the true top `k` found in the returned top `k`.
 ///
 /// - Only the first `k` of each list count; a returned id counts once even if repeated.
 /// - When fewer than `k` documents pass the filter, the denominator is how many do.
-/// - When none pass, there is nothing to find and recall is 1. Returning documents that do
+/// - When none pass, there is nothing to find and recall is 1. `RecallReport` keeps such
+///   queries out of its statistics (`add_query`, `add_empty`). Returning documents that do
 ///   not pass the filter is a correctness bug for the engine's own tests, not a recall loss.
 pub fn recall_at_k(truth: &[usize], got: &[usize], k: usize) -> f64 {
     let truth = &truth[..k.min(truth.len())];
@@ -29,7 +35,10 @@ pub const DEFAULT_BAND_EDGES: [f64; 5] = [0.0001, 0.001, 0.01, 0.1, 1.0];
 pub struct BandSummary {
     pub lower: f64,
     pub upper: f64,
+    /// Queries with something to find; the statistics below are over these.
     pub queries: usize,
+    /// Queries whose filter kept no document. Not part of the statistics.
+    pub empty: usize,
     pub mean: f64,
     pub min: f64,
     /// 5th percentile (nearest rank): the recall that 95% of queries in the band reach.
@@ -41,6 +50,7 @@ pub struct BandSummary {
 pub struct RecallReport {
     edges: Vec<f64>,
     samples: Vec<Vec<f64>>,
+    empty: Vec<usize>,
 }
 
 impl RecallReport {
@@ -55,24 +65,52 @@ impl RecallReport {
         Self {
             edges: edges.to_vec(),
             samples: vec![Vec::new(); edges.len()],
+            empty: vec![0; edges.len()],
         }
     }
 
+    /// Adds one query's recall. Only for queries with something to find: a query whose filter
+    /// kept no document goes to `add_empty` (or use `add_query`, which decides).
     pub fn add(&mut self, selectivity: f64, recall: f64) {
+        assert!((0.0..=1.0).contains(&recall), "recall {recall}");
+        let band = self.band(selectivity);
+        self.samples[band].push(recall);
+    }
+
+    /// Counts a query whose filter kept no document.
+    pub fn add_empty(&mut self, selectivity: f64) {
+        let band = self.band(selectivity);
+        self.empty[band] += 1;
+    }
+
+    /// Scores one query against its ground truth and adds it where it belongs.
+    pub fn add_query(&mut self, selectivity: f64, truth: &[usize], got: &[usize], k: usize) {
+        if truth.is_empty() || k == 0 {
+            self.add_empty(selectivity);
+        } else {
+            self.add(selectivity, recall_at_k(truth, got, k));
+        }
+    }
+
+    /// Queries counted by `add_empty`, over all bands.
+    pub fn empty_queries(&self) -> usize {
+        self.empty.iter().sum()
+    }
+
+    fn band(&self, selectivity: f64) -> usize {
         assert!(
             (0.0..=1.0).contains(&selectivity),
             "selectivity {selectivity}"
         );
-        assert!((0.0..=1.0).contains(&recall), "recall {recall}");
-        let band = self
-            .edges
+        self.edges
             .iter()
             .position(|upper| selectivity <= *upper)
-            .expect("the last edge is 1.0");
-        self.samples[band].push(recall);
+            .expect("the last edge is 1.0")
     }
 
-    /// One summary per band that received at least one query, lowest selectivity first.
+    /// One summary per band with at least one query that had something to find, lowest
+    /// selectivity first. Bands that only saw empty queries are left out (`empty_queries`
+    /// still counts them).
     pub fn bands(&self) -> Vec<BandSummary> {
         self.samples
             .iter()
@@ -88,6 +126,7 @@ impl RecallReport {
                     lower: if i == 0 { 0.0 } else { self.edges[i - 1] },
                     upper: self.edges[i],
                     queries: n,
+                    empty: self.empty[i],
                     mean: sorted.iter().sum::<f64>() / n as f64,
                     min: sorted[0],
                     p5: sorted[rank - 1],
@@ -104,8 +143,9 @@ impl RecallReport {
             .reduce(|a, b| if b.mean < a.mean { b } else { a })
     }
 
-    /// The M0 criterion (3): mean recall in the weakest band is at least `threshold` (0.90 in
-    /// PLAN 2장). False when there is nothing to judge.
+    /// The recall half of the M0 criterion (3): mean recall in the weakest band is at least
+    /// `threshold` (0.90 in PLAN 2장). The p99 latency half is not judged here. False when
+    /// there is nothing to judge.
     pub fn meets(&self, threshold: f64) -> bool {
         self.weakest().is_some_and(|w| w.mean >= threshold)
     }
@@ -183,6 +223,55 @@ mod tests {
         t.add(0.5, 0.9);
         t.add(0.005, 0.9);
         assert_eq!(t.weakest().unwrap().upper, 0.01);
+    }
+
+    #[test]
+    fn empty_truth_queries_do_not_lift_the_weakest_band() {
+        let mut r = RecallReport::new(&DEFAULT_BAND_EDGES);
+        for _ in 0..10 {
+            r.add(0.5, 1.0);
+            r.add_query(0.00005, &[1, 2], &[1, 9], 2); // 0.5
+            r.add_query(0.0, &[], &[3], 2); // nothing to find
+            r.add_empty(0.00001);
+        }
+        let w = r.weakest().unwrap();
+        assert_eq!((w.upper, w.queries, w.empty), (0.0001, 10, 20));
+        assert_eq!(w.mean, 0.5);
+        assert!(!r.meets(0.9));
+        assert_eq!(r.empty_queries(), 20);
+        // k = 0 has nothing to find either.
+        r.add_query(0.5, &[1], &[1], 0);
+        assert_eq!(r.empty_queries(), 21);
+        // A band that only saw empty queries is not reported and cannot pass or fail.
+        let mut only_empty = RecallReport::new(&DEFAULT_BAND_EDGES);
+        only_empty.add_empty(0.0);
+        assert!(only_empty.bands().is_empty());
+        assert!(!only_empty.meets(0.9));
+        assert_eq!(only_empty.empty_queries(), 1);
+    }
+
+    /// The criterion uses the band mean, not its minimum or low percentile.
+    #[test]
+    fn criterion_is_judged_on_the_band_mean() {
+        let mut r = RecallReport::new(&DEFAULT_BAND_EDGES);
+        // Band (1%, 10%]: mean 0.922, min and p5 0.5.
+        r.add(0.05, 0.5);
+        for _ in 0..9 {
+            r.add(0.05, 0.968_888_888_888_888_9);
+        }
+        // Band (10%, 100%]: higher mean 0.95, but a lower min and p5 (0.4).
+        r.add(0.5, 0.4);
+        for _ in 0..19 {
+            r.add(0.5, (19.0 - 0.4) / 19.0);
+        }
+        let w = r.weakest().unwrap();
+        assert_eq!(
+            w.upper, 0.1,
+            "the weakest band is the one with the lowest mean"
+        );
+        assert!((w.mean - 0.922).abs() < 1e-9, "{}", w.mean);
+        assert_eq!((w.min, w.p5), (0.5, 0.5));
+        assert!(r.meets(0.9));
     }
 
     #[test]

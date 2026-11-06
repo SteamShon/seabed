@@ -8,7 +8,7 @@ use seabed_domain::{NamespaceId, NamespaceKeys, TenantId};
 use seabed_engine::namespace::{Namespace, Op};
 use seabed_harness::cost::{delta, monthly_cost, Prices, Workload};
 use seabed_harness::dataset::{Dataset, Filter, SyntheticSpec};
-use seabed_harness::recall::{recall_at_k, RecallReport, DEFAULT_BAND_EDGES};
+use seabed_harness::recall::{RecallReport, DEFAULT_BAND_EDGES};
 use seabed_harness::truth::{exact_knn, Metric};
 
 const K: usize = 10;
@@ -17,7 +17,8 @@ fn dataset() -> Dataset {
     Dataset::synthetic(&SyntheticSpec {
         n: 20_000,
         dims: 16,
-        clusters: 50,
+        // Odd, so a document's cluster (id % clusters) does not follow its id's parity.
+        clusters: 49,
         spread: 0.3,
         attr_cardinality: 100_000,
         seed: 1,
@@ -40,7 +41,7 @@ fn measure(data: &Dataset, search: impl Fn(&[f32], Filter) -> Vec<usize>) -> Rec
         for f in FILTERS {
             let truth = exact_knn(data, &q, K, Metric::L2, f);
             let got = search(&q, f);
-            report.add(data.selectivity(f), recall_at_k(&truth, &got, K));
+            report.add_query(data.selectivity(f), &truth, &got, K);
         }
     }
     report
@@ -60,8 +61,9 @@ fn an_exact_search_passes_every_band() {
     assert!(report.meets(0.90));
 }
 
-/// A search that only sees half the documents (even ids) loses about half the neighbours in
-/// every band with enough matches, and the harness says so.
+/// A search that only sees half the documents (even ids, spread over every cluster) loses
+/// about half the neighbours of every query in every band with enough matches, and the
+/// harness says so.
 #[test]
 fn a_search_that_misses_half_the_data_fails_the_criterion() {
     let data = dataset();
@@ -79,13 +81,18 @@ fn a_search_that_misses_half_the_data_fails_the_criterion() {
         exact_knn(&half, q, K, Metric::L2, f)
     });
     assert!(!report.meets(0.90));
-    let unfiltered = report.bands().pop().unwrap();
-    assert_eq!(unfiltered.upper, 1.0);
-    assert!(
-        (0.3..0.7).contains(&unfiltered.mean),
-        "mean {}",
-        unfiltered.mean
-    );
+    // Bands above 0.1% keep at least 20 documents, so each query has a full top 10 to lose
+    // half of: the mean is near 0.5 and no query loses everything.
+    let wide: Vec<_> = report
+        .bands()
+        .into_iter()
+        .filter(|b| b.lower >= 0.001)
+        .collect();
+    assert_eq!(wide.len(), 3, "{wide:?}");
+    for b in wide {
+        assert!((0.3..0.7).contains(&b.mean), "{b:?}");
+        assert!(b.p5 > 0.0, "{b:?}");
+    }
 }
 
 /// A strong read's measured requests, priced and scaled to a month. The counts match the
