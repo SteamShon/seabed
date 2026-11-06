@@ -24,7 +24,8 @@
 - ✅ 판정 기준 초안 고정: 전체 재빌드 24시간 이내(그동안 서비스 p99 증가 10% 이내), 월 비용 turbopuffer +30% 이내, 가장 약한 구간 recall@10 ≥ 0.90(p99 ≤ 1초) (#4, PLAN 2장)
 - ✅ 최소 하네스 `seabed-harness`(#29): seed 고정 합성 데이터셋(가우시안 군집 + 정수 속성 하나, 벡터와 독립), brute-force 정답 kNN(L2, 내적, cosine, 필터), recall@k와 selectivity 구간별 요약(구간 경계 0.01%·0.1%·1%·10%·100%, 필터 통과 문서가 없는 질의는 통계에서 빼고 따로 셈, 가장 약한 구간의 평균으로 기준 (3)의 recall 부분 판정. p99 지연은 아직 재지 않음), 요청 수 기반 월 비용 모델(`CountingObjectStore` 측정값 × 워크로드, 저장은 GB = 2^30 바이트, 기준 (2)의 +30% 판정). 기본 S3 단가는 리뷰에서 AWS Price List API(2026-11-04 게시)와 대조함
 - ✅ 데이터셋 입력과 상관 필터(#30): `Dataset::new`(모양과 유한값 검사)와 합성 생성기 분리, `.fvecs`/`.ivecs`/`.bvecs` 읽기·쓰기(SIFT, GIST, BIGANN 형식, 개수 제한, 잘림·차원 오류 검출, 정답 id), 속성 생성기 `attrs::uniform`과 `attrs::correlated`(무작위 방향 투영 순위로 상관 강도 0~1 조절, 필터 통과 비율은 유지). `RecallReport::unjudged_bands`로 판정하지 못한 구간을 드러냄
-- ⬜ 벤치마크 러너(VectorDBBench 재사용 여부 포함), 데이터셋 내려받기와 다른 형식(ann-benchmarks HDF5, BIGANN `.fbin`), HCBGen 기반 필터 생성기
+- ⬜ 벤치마크 러너(VectorDBBench 재사용 여부 포함). `unjudged_bands`가 비지 않으면 통과가 아니라 "판정 불가"로 보고한다
+- ⬜ 데이터셋 내려받기와 다른 형식(ann-benchmarks HDF5, BIGANN `.fbin`), HCBGen 기반 필터 생성기
 - ⬜ 가격 확인: turbopuffer 가격, 컴퓨트 단가
 - ⬜ 시나리오 S1~S10
 - ⬜ 기준선 측정: Chroma, Lance, Milvus, Qdrant, VectorChord
@@ -88,7 +89,7 @@ PLAN 7장의 "현재 상태" 문단에 있던 동작 설명을 옮기고, 리뷰
 
 ### 남은 작은 항목 (리뷰에서 "나중에")
 
-항목마다 (나온 PR, 그 리뷰 코멘트의 날짜 KST)를 붙입니다. 해결한 PR에서 지웁니다. 릴리스 때 문서 정리 PR이 한 릴리스 넘게 남은 항목을 처리합니다(CONTRIBUTING.md "릴리스" 1단계). #17부터 #29 리뷰 2차까지의 모든 라운드를 코드와 대조해 열린 항목을 모았습니다.
+항목마다 (나온 PR, 그 리뷰 코멘트의 날짜 KST)를 붙입니다. 해결한 PR에서 지웁니다. 릴리스 때 문서 정리 PR이 한 릴리스 넘게 남은 항목을 처리합니다(CONTRIBUTING.md "릴리스" 1단계). #17부터 #30 리뷰 1차까지의 모든 라운드를 코드와 대조해 열린 항목을 모았습니다.
 
 - `ManifestError::CommitConflict` 문서의 "다시 commit하면 알 수 있다"는 저장소가 그 키를 내줄 때만 성립 (#19, 2026-11-06)
 - 테스트 래퍼 `ScriptedVersions`의 "첫 GET"이 어느 키인지가 호출 순서에 달린다는 점을 주석에 적기 (#19, 2026-11-06)
@@ -130,3 +131,7 @@ PLAN 7장의 "현재 상태" 문단에 있던 동작 설명을 옮기고, 리뷰
 - harness가 문서당 벡터 하나, 속성 `u32` 하나만 담음. S4(multi-vector)와 여러 속성은 해당 시나리오 PR에서 (#29, 2026-11-06)
 - harness `cost::delta`가 인자 순서가 바뀌면 debug에서 panic, release에서 값이 감쌈. `checked_sub`로 의미 있는 메시지 (#29, 2026-11-06)
 - README 저장소 구조에 `adapter-objectstore-s3/`가 없고, "외부 크레이트 없음" 문장이 틀림 (#29, 2026-11-06)
+- PR 본문 끝의 footer가 쓴 그대로 남지 않음: #29 본문을 고친 뒤 footer가 사라졌고, #30 본문의 footer 링크는 쓴 것과 다름. 어디서 바뀌는지 확인하기 (#30, 2026-11-06)
+- harness `Dataset`의 필드가 공개라 `Dataset::new`의 검사를 우회할 수 있고, `Vec<Vec<f32>>`라 큰 데이터에서 메모리와 mmap에 불리함(bvecs는 f32로 넓혀 4배). 러너 PR 전에 평탄한 버퍼와 `vector(i)` 접근자, `with_attrs`로 (#30, 2026-11-06)
+- `attrs::correlated`는 무작위 방향 slab 모델. PLAN 10장 1번의 "광고주 하나 = 군집 하나"에 맞는 군집 정렬 모드와, selectivity 추정을 시험할 생성기는 HCBGen 필터 PR에서 (#30, 2026-11-06)
+- harness `vecs`: writer가 reader가 거부할 입력(차원 0, 섞인 차원)을 씀, 모듈 문서에 `BufReader` 안내 없음, `read_truth_ivecs`가 id 범위(문서 수 미만)를 검사하지 않음 (#30, 2026-11-06)

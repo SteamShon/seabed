@@ -254,6 +254,21 @@ mod tests {
         assert_eq!(a.queries(5, 1).len(), 5);
     }
 
+    /// Attributes come from their own stream: changing how they are drawn leaves the
+    /// vectors (and the queries) exactly as they were.
+    #[test]
+    fn attr_stream_does_not_move_vectors() {
+        let a = spec().generate();
+        let b = SyntheticSpec {
+            attr_cardinality: 7,
+            ..spec()
+        }
+        .generate();
+        assert_eq!(a.data.vectors, b.data.vectors);
+        assert_ne!(a.data.attrs, b.data.attrs);
+        assert_eq!(a.queries(5, 1), b.queries(5, 1));
+    }
+
     #[test]
     fn attr_below_keeps_about_the_chosen_fraction() {
         let d = spec().generate().data;

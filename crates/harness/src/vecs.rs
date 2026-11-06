@@ -60,16 +60,20 @@ impl From<io::Error> for VecsError {
 
 pub fn read_fvecs(r: impl Read, limit: Option<usize>) -> Result<Vec<Vec<f32>>, VecsError> {
     read(r, limit, 4, |b| {
-        b.chunks_exact(4)
-            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        b.as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect()
     })
 }
 
 pub fn read_ivecs(r: impl Read, limit: Option<usize>) -> Result<Vec<Vec<i32>>, VecsError> {
     read(r, limit, 4, |b| {
-        b.chunks_exact(4)
-            .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+        b.as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| i32::from_le_bytes(*c))
             .collect()
     })
 }
@@ -267,6 +271,18 @@ mod tests {
         assert!(matches!(
             read_truth_ivecs(&ib[..], None),
             Err(VecsError::NegativeId { index: 1 })
+        ));
+    }
+
+    #[test]
+    fn max_dims_is_the_largest_accepted_dimension() {
+        let mut at_max = (MAX_DIMS as i32).to_le_bytes().to_vec();
+        at_max.resize(4 + MAX_DIMS, 7);
+        assert_eq!(read_bvecs(&at_max[..], None).unwrap()[0].len(), MAX_DIMS);
+        let above = (MAX_DIMS as i32 + 1).to_le_bytes();
+        assert!(matches!(
+            read_bvecs(&above[..], None),
+            Err(VecsError::BadDims { index: 0, dims }) if dims == MAX_DIMS as i64 + 1
         ));
     }
 

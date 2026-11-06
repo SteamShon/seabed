@@ -16,7 +16,7 @@ use seabed_harness::vecs::{read_fvecs, read_truth_ivecs, write_fvecs, write_ivec
 const K: usize = 10;
 
 fn synthetic() -> Synthetic {
-    SyntheticSpec {
+    let mut s = SyntheticSpec {
         n: 20_000,
         dims: 16,
         // Odd, so a document's cluster (id % clusters) does not follow its id's parity.
@@ -25,12 +25,23 @@ fn synthetic() -> Synthetic {
         attr_cardinality: 100_000,
         seed: 1,
     }
-    .generate()
+    .generate();
+    // The most selective filter keeps exactly one document (0.005%), independent of how the
+    // attribute stream happens to fall: document 0 gets 0, anything else below 6 moves up.
+    for (i, a) in s.data.attrs.iter_mut().enumerate() {
+        if i == 0 {
+            *a = 0;
+        } else if *a < 6 {
+            *a += 6;
+        }
+    }
+    assert_eq!(s.data.selectivity(FILTERS[0]), 1.0 / 20_000.0);
+    s
 }
 
 /// One filter per default band: about 0.005%, 0.05%, 0.5%, 5% and 100% of the documents.
 const FILTERS: [Filter; 5] = [
-    // With this seed exactly one document has an attribute below 6.
+    // `synthetic` pins exactly one document below 6, whatever the seed.
     Filter::AttrBelow(6),
     Filter::AttrBelow(50),
     Filter::AttrBelow(500),
@@ -138,6 +149,10 @@ fn a_run_from_vector_files_matches_the_in_memory_run() {
     assert_eq!(loaded, s.data);
     let loaded_queries = read_fvecs(&query_file[..], None).unwrap();
     let loaded_truth = read_truth_ivecs(&truth_file[..], None).unwrap();
+    assert_eq!(loaded_queries, queries);
+    for (q, t) in loaded_queries.iter().zip(&loaded_truth) {
+        assert_eq!(t, &exact_knn(&loaded, q, K, Metric::L2, filter));
+    }
 
     // A search that returns the second half of the true top 10 only.
     let mut from_files = RecallReport::new(&DEFAULT_BAND_EDGES);
