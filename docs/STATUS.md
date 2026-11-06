@@ -100,3 +100,8 @@ PLAN 7장의 "현재 상태" 문단에 있던 동작 설명을 옮기고, 리뷰
 - `status-check-test.sh`가 바뀐 파일 목록 만들기의 실패를 테스트 실패로 치지 않음(`listed && check`) (#22, 2026-11-06)
 - `status.yml`에 `shellcheck .github/scripts/*.sh` 단계 추가 (#22, 2026-11-06)
 - 정리 PR이 마지막 라운드뿐 아니라 모든 리뷰 라운드의 "나중에"를 대조하게 하기 (#23, 2026-11-06)
+- AGENTS.md: 같은 STATUS 절을 고치는 열린 PR이 있으면 "나중에"를 그 PR에 적고 본문에 밝힌다는 예외 문장 (#22, 2026-11-06)
+- CONTRIBUTING.md 릴리스 1단계의 "[결정]으로 바꾸거나"를 "사용자에게 확인받아 [결정]으로 바꾸거나, 후보를 PR 설명에 적습니다"로 (#24, 2026-11-06)
+- CONTRIBUTING.md의 develop 커밋 찾는 법(`git log --grep`)이 본문 줄에도 걸림. 제목만 보게 하기 (#24, 2026-11-06)
+- `within()`의 Disconnected arm에 "catch_unwind가 항상 send하므로 보통 닿지 않음" 주석 (#24, 2026-11-06)
+- 저장소 ruleset에 `check`(ci.yml: fmt, clippy, test)를 필수 검사로 추가. 사용자 설정 (#24, 2026-11-06)

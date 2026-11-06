@@ -4,7 +4,7 @@ name: STATUS check
 # this check, not the whole build.
 on:
   pull_request:
-    branches: [develop]
+    branches: [develop, main]
     types: [opened, edited, synchronize, reopened]
 
 permissions:
@@ -27,4 +27,6 @@ jobs:
       - name: STATUS.md updated or exempted
         env:
           PR_BODY: ${{ github.event.pull_request.body }}
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_REF: ${{ github.head_ref }}
         run: .github/scripts/status-check.sh "$RUNNER_TEMP/changed.txt"

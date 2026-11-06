@@ -4,13 +4,19 @@
 # "진행 상황 기록" has the rule; this check only makes sure the decision is not forgotten.
 #
 # Usage: status-check.sh <changed-files-file>   (PR body in the PR_BODY environment variable)
-# The file comes from status-changed-files.sh.
+# The file comes from status-changed-files.sh. BASE_REF and HEAD_REF (the PR's branches) are
+# optional: a release PR (develop into main) passes at once, because it only carries PRs that
+# already passed this check on their way into develop.
 set -euo pipefail
 
 changed="${1:-}"
 watched='^(crates/|\.github/|Cargo\.(toml|lock)$)'
 exemption='^STATUS: 해당 없음 *(—|-) *[^ ].*'
 
+if [ "${BASE_REF:-}" = main ] && [ "${HEAD_REF:-}" = develop ]; then
+  echo "ok: release PR (develop into main)"
+  exit 0
+fi
 if [ -z "$changed" ] || [ ! -r "$changed" ]; then
   echo "::error::no readable list of changed files: '$changed'"
   exit 2

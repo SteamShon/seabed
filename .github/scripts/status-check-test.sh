@@ -7,9 +7,10 @@ tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 bad=0
 
-# check <name> <list file> <PR body> <pass|fail>
+# check <name> <list file> <PR body> <pass|fail> [<base ref> <head ref>]
 check() {
-  if PR_BODY="$3" "$here/status-check.sh" "$2" > /dev/null 2>&1; then got=pass; else got=fail; fi
+  if BASE_REF="${5:-develop}" HEAD_REF="${6:-feature}" PR_BODY="$3" \
+    "$here/status-check.sh" "$2" > /dev/null 2>&1; then got=pass; else got=fail; fi
   if [ "$got" = "$4" ]; then echo "ok   $1"; else echo "FAIL $1: got $got, want $4"; bad=1; fi
 }
 
@@ -35,6 +36,11 @@ case_ "nested crates dir"          "docs/crates/x.md"                         ""
 case_ "STATUS look-alike"          "crates/x.rs docs/STATUS.md.bak"           ""                                      fail
 case_ "empty diff"                 ""                                         ""                                      pass
 check "missing list"               "$tmp/does-not-exist.txt"                  ""                                      fail
+
+printf '%s\n' crates/engine/src/wal.rs > "$tmp/code.txt"
+check "release PR passes"          "$tmp/code.txt"  ""  pass  main develop
+check "other PR into main checked" "$tmp/code.txt"  ""  fail  main hotfix/x
+check "develop as head into develop" "$tmp/code.txt" "" fail  develop develop
 
 # The list as status-changed-files.sh makes it, from a real repository.
 repo="$tmp/repo"

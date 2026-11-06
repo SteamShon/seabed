@@ -55,7 +55,7 @@
 
 - [docs/STATUS.md](docs/STATUS.md)의 어떤 줄이 PR 때문에 틀리게 되면 같은 PR에서 고칩니다. 종류(feat, fix, test, chore, docs)와 상관없이 결과로 판단합니다. 항목 추가, 상태 변경, "나중에" 항목의 해결(목록에서 지움)이 모두 해당합니다.
 - 리뷰에서 "나중에"로 남은 항목은 리뷰 반영 커밋을 만들 때 그 커밋에 함께 적습니다. 마지막 리뷰 라운드에서 나온 것(그 뒤 커밋이 없는 것)은 다음에 STATUS.md를 고치는 PR에서 적습니다. 이것만을 위해 head를 바꾸지 않습니다.
-- CI(`.github/workflows/status.yml`)는 `crates/`, `.github/`, `Cargo.toml`, `Cargo.lock`을 바꾸고 STATUS.md를 바꾸지 않은 PR을 실패시킵니다. 고칠 줄이 없으면 PR 본문에 `STATUS: 해당 없음 — <이유>` 한 줄을 적습니다. 이유가 맞는지는 리뷰어가 봅니다.
+- CI(`.github/workflows/status.yml`)는 `crates/`, `.github/`, `Cargo.toml`, `Cargo.lock`을 바꾸고 STATUS.md를 바꾸지 않은 PR을 실패시킵니다. 고칠 줄이 없으면 PR 본문에 `STATUS: 해당 없음 — <이유>` 한 줄을 적습니다. `develop` → `main` 릴리스 PR은 이 검사를 바로 통과합니다(담긴 PR이 이미 develop에서 검사를 거쳤기 때문). 이유가 맞는지는 리뷰어가 봅니다.
 
 ## 커밋
 
