@@ -84,21 +84,19 @@ PLAN 7장의 "현재 상태" 문단에 있던 동작 설명을 옮기고, 리뷰
 
 ### 남은 작은 항목 (리뷰에서 "나중에")
 
-항목마다 (나온 PR, 그 리뷰 코멘트의 날짜 KST)를 붙입니다. 해결한 PR에서 지웁니다. 릴리스 때 문서 정리 PR이 한 릴리스 넘게 남은 항목을 처리합니다(CONTRIBUTING.md "릴리스" 1단계). #17부터 #23까지의 리뷰 코멘트를 모든 라운드에 걸쳐 코드와 대조해 열린 항목을 모았습니다.
+항목마다 (나온 PR, 그 리뷰 코멘트의 날짜 KST)를 붙입니다. 해결한 PR에서 지웁니다. 릴리스 때 문서 정리 PR이 한 릴리스 넘게 남은 항목을 처리합니다(CONTRIBUTING.md "릴리스" 1단계). #17부터 #23 리뷰 2차까지의 모든 라운드를 코드와 대조해 열린 항목을 모았습니다.
 
 - `ManifestError::CommitConflict` 문서의 "다시 commit하면 알 수 있다"는 저장소가 그 키를 내줄 때만 성립 (#19, 2026-11-06)
 - 테스트 래퍼 `ScriptedVersions`의 "첫 GET"이 어느 키인지가 호출 순서에 달린다는 점을 주석에 적기 (#19, 2026-11-06)
-- `Wal::pending_len` 공개 여부: 진단용으로 두거나 `#[doc(hidden)]` (#17, 2026-11-05)
-- 테스트 도우미 `within()`(`crates/engine/tests/wal.rs`)이 작업 스레드가 끊긴 경우(`Disconnected`)도 "timed out"으로 보고함 (#17, 2026-11-05)
-- `appends_with_other_ids_are_not_blocked`의 gate 대기가 `yield_now` 바쁜 대기. 채널이나 Barrier로 바꾸기(선택) (#17, 2026-11-05)
 - `namespace.rs` 문서의 "(32)" 표기와 줄바꿈 (#20, 2026-11-06)
 - manifest_content 장애 주입 테스트에서 덮어써지는 `cfg.seed` (#20, 2026-11-06)
 - CONTRIBUTING에 `#[non_exhaustive]` 정책과 "새 `StoreError` variant는 engine의 분류 지점 세 곳(manifest, wal, sot)을 확인" 규칙 (#20, 2026-11-06)
 - nightly: `workflow_dispatch`의 `ref` 선택, `permissions: contents: read`, `timeout-minutes` (#20, 2026-11-06)
-- `docs/PLAN.md` 6.4의 "`load_latest`는 manifest prefix 전체를 LIST"는 #5 이후 낡은 문장 (#21, 2026-11-06)
 - pr-review 스킬: 리뷰어가 PR 본문 원문(면제 줄)을 직접 읽게 하고, 리뷰 뒤 면제 줄만 바뀌면 그 줄만 다시 확인하는 규칙 (#22, 2026-11-06)
 - AGENTS.md 면제 줄 문장 앞에 "검사 경로를 바꾼 PR에서"를 붙여 적용 범위를 분명히 하기 (#22, 2026-11-06)
 - `status.yml`에 `concurrency` 설정(본문을 연달아 고칠 때 run이 겹침) (#22, 2026-11-06)
 - AGENTS.md의 "문서 정리 PR을 먼저 넣습니다"를 "필요하면 먼저"로 (#23, 2026-11-06)
 - STATUS.md 머리말의 "마지막 수정" 날짜는 STATUS를 고치는 PR마다 낡음. 빼고 git log에 맡길지 정하기 (#23, 2026-11-06)
+- `status-check-test.sh`가 바뀐 파일 목록 만들기의 실패를 테스트 실패로 치지 않음(`listed && check`) (#22, 2026-11-06)
+- `status.yml`에 `shellcheck .github/scripts/*.sh` 단계 추가 (#22, 2026-11-06)
 - 정리 PR이 마지막 라운드뿐 아니라 모든 리뷰 라운드의 "나중에"를 대조하게 하기 (#23, 2026-11-06)

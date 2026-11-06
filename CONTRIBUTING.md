@@ -102,7 +102,7 @@ cargo test --workspace
 
 1. **문서 정리 PR**을 먼저 develop에 넣습니다(일반 PR처럼 리뷰를 거칩니다). 정리할 것이 없으면 건너뜁니다.
    - 직전 릴리스 뒤에 머지된 PR들의 마지막 리뷰 보고서에서, 아직 STATUS.md에 없는 "나중에" 항목을 모아 적습니다.
-   - STATUS.md의 "나중에" 항목 중 한 릴리스 넘게 남은 것, 즉 나온 PR이 이미 main에 릴리스된 항목(`git merge-base --is-ancestor <그 PR의 develop 커밋> origin/main`이 참)은 지금 고치거나, GitHub 이슈로 옮기거나, 이유를 적고 지웁니다.
+   - STATUS.md의 "나중에" 항목 중 한 릴리스 넘게 남은 것, 즉 나온 PR이 이미 main에 릴리스된 항목(`git fetch origin` 뒤 `git merge-base --is-ancestor <그 PR의 develop 커밋> origin/main`이 참. develop 커밋은 PR의 squash 커밋으로, `git log origin/develop --grep='(#<번호>)$'`로 찾습니다)은 지금 고치거나, GitHub 이슈로 옮기거나, 이유를 적고 지웁니다.
    - STATUS.md 요약 표에서 상태가 ✅인 마일스톤은 상세 체크리스트를 한 줄 요약으로 접습니다.
    - PLAN.md와 DECISIONS.md에서 해소된 [제안]·[가설]은 [결정]으로 바꾸거나 지우고, 현재 상태를 말하는 문장이 STATUS.md 밖에 생겼으면 STATUS.md로 옮깁니다.
    - 지운 이유는 PR 설명과 squash 커밋 메시지에 남깁니다(브랜치 커밋 메시지는 squash로 사라질 수 있습니다). 지운 내용은 git 이력에 남습니다.

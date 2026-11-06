@@ -323,7 +323,12 @@ fn within<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
     match rx.recv_timeout(std::time::Duration::from_secs(20)) {
         Ok(Ok(v)) => v,
         Ok(Err(panic)) => std::panic::resume_unwind(panic),
-        Err(_) => panic!("timed out: an append never returned"),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            panic!("timed out: an append never returned")
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("the test thread ended without reporting a result")
+        }
     }
 }
 
