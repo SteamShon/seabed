@@ -6,8 +6,10 @@
 //! Mapping to the port:
 //! - `If-None-Match: *` is `PutMode::Create` and `If-Match` is `PutMode::Update` with the etag.
 //!   A refused create (412, or 409 for a concurrent conditional write) is `PreconditionFailed`;
-//!   a refused update is `PreconditionFailed` (412) or `Conflict` (409). The engine reads the
-//!   key back after any refusal, so the two only differ in what they report.
+//!   a refused update is `PreconditionFailed` (412) or `Conflict` (409). The WAL append, the
+//!   SoT write, the manifest commit and the pointer advance re-read the key after either and
+//!   handle both alike. `SegmentStore::write` does not re-read: a refused segment create, 412
+//!   or 409, becomes `SegmentError::AlreadyExists`.
 //! - The client's own retries are off: transient failures surface as `Unavailable`, and the
 //!   engine's read retries and write budgets decide what to retry. A request that may have
 //!   reached the store (a timeout, a 5xx) is always reported as `Unavailable`, never as a
@@ -15,7 +17,11 @@
 //! - S3 etags are content hashes (MD5 for single-part uploads): writing the same bytes again
 //!   gives the same etag. The engine only compares etags it read back, and the manifest pointer
 //!   only moves forward, so this cannot cause an ABA on `If-Match`.
-//! - `list` sends the prefix as is (no trailing delimiter) and sorts the result by key.
+//! - `get_range` costs a HEAD (to report a missing key and a range past the end) and a GET
+//!   that carries the HEAD's etag in `If-Match`. If the object changed in between, the GET is
+//!   refused and the read reports `Unavailable`, so the caller retries it.
+//! - `list` sends the prefix as is (no trailing delimiter), follows every page and sorts the
+//!   result by key.
 //!
 //! Every key is stored under an optional root prefix, so one bucket can hold several
 //! independent stores (tests give each store a fresh root).
@@ -43,6 +49,8 @@ pub struct S3ObjectStore {
     /// Prepended to every key; empty or ending in `/`.
     root: String,
     durability: DurabilityClass,
+    /// Keys per `list` page; `None` leaves it to the store (1000 on S3).
+    list_page_size: Option<usize>,
 }
 
 impl S3ObjectStore {
@@ -68,6 +76,7 @@ impl S3ObjectStore {
             runtime,
             root: String::new(),
             durability,
+            list_page_size: None,
         })
     }
 
@@ -79,6 +88,13 @@ impl S3ObjectStore {
         } else {
             format!("{root}/")
         };
+        self
+    }
+
+    /// Asks for at most `n` keys per `list` page. Only tests need this: it makes a short
+    /// listing span several pages.
+    pub fn with_list_page_size(mut self, n: usize) -> Self {
+        self.list_page_size = Some(n);
         self
     }
 
@@ -150,17 +166,22 @@ impl ObjectStore for S3ObjectStore {
             if range.start == range.end {
                 return Ok(Vec::new());
             }
+            // The GET only succeeds on the object the HEAD saw.
             let options = GetOptions {
                 range: Some(GetRange::Bounded(range.clone())),
+                if_match: meta.e_tag.clone(),
                 ..GetOptions::default()
             };
-            let r = self.client.get_opts(&path, options).await.map_err(plain)?;
+            let changed = || StoreError::Unavailable("object changed during a range read".into());
+            let r = match self.client.get_opts(&path, options).await {
+                Ok(r) => r,
+                Err(object_store::Error::Precondition { .. }) => return Err(changed()),
+                Err(e) => return Err(plain(e)),
+            };
             let bytes = r.bytes().await.map_err(plain)?;
             if bytes.len() as u64 != range.end - range.start {
-                // The object changed between the HEAD and the GET.
-                return Err(StoreError::Unavailable(
-                    "object changed during a range read".into(),
-                ));
+                // A store that ignored the If-Match and served a shorter object.
+                return Err(changed());
             }
             Ok(bytes.to_vec())
         })
@@ -205,6 +226,7 @@ impl ObjectStore for S3ObjectStore {
                         Some(&full_prefix),
                         PaginatedListOptions {
                             page_token: page_token.take(),
+                            max_keys: self.list_page_size,
                             ..PaginatedListOptions::default()
                         },
                     )

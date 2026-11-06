@@ -14,9 +14,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use object_store::aws::AmazonS3Builder;
 use seabed_adapter_objectstore_s3::S3ObjectStore;
+use seabed_domain::Key;
 use seabed_domain::{NamespaceId, NamespaceKeys, TenantId};
 use seabed_engine::namespace::{Namespace, Op};
-use seabed_ports::DurabilityClass;
+use seabed_ports::{DurabilityClass, ObjectStore, PutCondition};
 
 /// The endpoint, or `None` to skip. With `SEABED_S3_REQUIRED=1` (set in CI) a missing endpoint
 /// fails the test instead of skipping it, so a broken CI setup cannot pass silently.
@@ -67,8 +68,38 @@ fn s3_store_passes_the_object_store_conformance_suite() {
     seabed_conformance::run_object_store_suite(|| fresh_store(&endpoint));
 }
 
-/// The engine's whole write path on S3: a write, a flush into a Parquet segment with a manifest
-/// commit (pointer included), and a strong read that merges the segment with a newer tail.
+/// A listing longer than one page comes back whole and in order.
+#[test]
+fn list_follows_every_page() {
+    let Some(endpoint) = endpoint() else {
+        eprintln!("skipped: SEABED_S3_ENDPOINT is not set");
+        return;
+    };
+    let store = fresh_store(&endpoint).with_list_page_size(2);
+    let names = ["p/0", "p/1", "p/2", "p/3", "p/4"];
+    for n in names {
+        store
+            .put(&Key::new(n), vec![1], PutCondition::Unconditional)
+            .unwrap();
+    }
+    let listed: Vec<String> = store
+        .list("p/")
+        .unwrap()
+        .into_iter()
+        .map(|m| m.key.as_str().to_string())
+        .collect();
+    assert_eq!(listed, names);
+}
+
+/// The manifest pointer's value, read straight from the store.
+fn pointer(store: &S3ObjectStore, keys: &NamespaceKeys) -> u64 {
+    let (bytes, _) = store.get(&keys.manifest_pointer_key()).unwrap();
+    u64::from_le_bytes(bytes.as_slice().try_into().unwrap())
+}
+
+/// The engine's whole write path on S3: writes, two flushes into Parquet segments with manifest
+/// commits, and a strong read that merges the segments with a newer tail. The first flush
+/// creates the manifest pointer (`If-None-Match`), the second moves it (`If-Match`).
 #[test]
 fn namespace_writes_flushes_and_reads_back_on_s3() {
     let Some(endpoint) = endpoint() else {
@@ -89,9 +120,17 @@ fn namespace_writes_flushes_and_reads_back_on_s3() {
         ],
     )
     .unwrap();
-    let flushed = ns.flush().unwrap().expect("something to flush");
-    assert_eq!(flushed.rows, 2);
-    ns.write(2, &[Op::delete("b"), Op::upsert("c", vec![])])
+    let first = ns.flush().unwrap().expect("something to flush");
+    assert_eq!(first.rows, 2);
+    assert_eq!(pointer(&store, &keys), first.version.get());
+
+    ns.write(2, &[Op::upsert("d", vec![vec![3.0, 4.0]])])
+        .unwrap();
+    let second = ns.flush().unwrap().expect("something to flush");
+    assert!(second.version > first.version);
+    assert_eq!(pointer(&store, &keys), second.version.get());
+
+    ns.write(3, &[Op::delete("b"), Op::upsert("c", vec![])])
         .unwrap();
 
     // A second Namespace over the same store sees the same state: nothing lives in memory.
@@ -102,5 +141,5 @@ fn namespace_writes_flushes_and_reads_back_on_s3() {
         .into_iter()
         .map(|r| r.id)
         .collect();
-    assert_eq!(ids, ["a", "c"]);
+    assert_eq!(ids, ["a", "c", "d"]);
 }
