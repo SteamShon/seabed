@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::thread;
 
 use seabed_adapter_objectstore_mem::{
-    CountingObjectStore, FaultConfig, FaultInjecting, MemObjectStore,
+    fault_seeds, CountingObjectStore, FaultConfig, FaultInjecting, MemObjectStore, SeedOnPanic,
 };
 use seabed_domain::{Lsn, NamespaceId, NamespaceKeys, TenantId};
 use seabed_engine::wal::{Wal, WalError};
@@ -71,9 +71,16 @@ fn concurrent_appends_get_unique_contiguous_lsns() {
 
 #[test]
 fn lost_responses_do_not_duplicate_or_lose_entries() {
+    for seed in fault_seeds(42..43) {
+        let _seed = SeedOnPanic::new(seed);
+        lost_responses_do_not_duplicate_or_lose_entries_with(seed);
+    }
+}
+
+fn lost_responses_do_not_duplicate_or_lose_entries_with(seed: u64) {
     let mem = Arc::new(MemObjectStore::new());
     let cfg = FaultConfig {
-        seed: 42,
+        seed,
         put_unavailable_ppm: 100_000,
         put_lose_response_ppm: 200_000,
         put_conflict_ppm: 50_000,

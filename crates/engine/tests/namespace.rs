@@ -4,11 +4,13 @@ use std::sync::atomic::Ordering::SeqCst;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use seabed_adapter_objectstore_mem::{FaultConfig, FaultInjecting, MemObjectStore};
+use seabed_adapter_objectstore_mem::{
+    fault_seeds, FaultConfig, FaultInjecting, MemObjectStore, SeedOnPanic,
+};
 use seabed_domain::{ETag, Key, NamespaceId, NamespaceKeys, TenantId, Version};
 use seabed_engine::manifest::{ManifestError, ManifestStore};
 use seabed_engine::manifest_content::AttrKind;
-use seabed_engine::namespace::{Namespace, NamespaceError, Op};
+use seabed_engine::namespace::{Namespace, NamespaceError, Op, SCHEMA_COMMIT_ATTEMPTS};
 use seabed_engine::sot::{AttrValue, SotError};
 use seabed_engine::wal::WalError;
 use seabed_engine::RetryPolicy;
@@ -394,9 +396,16 @@ fn writes_racing_with_flushes_are_never_lost() {
 
 #[test]
 fn reads_and_flushes_survive_injected_faults() {
+    for seed in fault_seeds(5..6) {
+        let _seed = SeedOnPanic::new(seed);
+        reads_and_flushes_survive_injected_faults_with(seed);
+    }
+}
+
+fn reads_and_flushes_survive_injected_faults_with(seed: u64) {
     let mem = Arc::new(MemObjectStore::new());
     let cfg = FaultConfig {
-        seed: 5,
+        seed,
         put_unavailable_ppm: 50_000,
         put_lose_response_ppm: 100_000,
         put_conflict_ppm: 0,
@@ -976,7 +985,7 @@ fn same_type_schema_race_both_writers_succeed_with_one_version() {
 
 /// Every version create is refused with nothing behind it. A write that adds an attribute keeps
 /// reloading after each `CommitConflict`, so its cost is bounded by `SCHEMA_COMMIT_ATTEMPTS`
-/// (32) times the write budget, appends nothing, and reports `SchemaCommitContention` (not a
+/// times the write budget, appends nothing, and reports `SchemaCommitContention` (not a
 /// manifest error: every single commit ended as `CommitConflict`).
 #[test]
 fn endless_empty_refusals_end_a_write_after_bounded_tries() {
@@ -999,12 +1008,12 @@ fn endless_empty_refusals_end_a_write_after_bounded_tries() {
         n.write(1, &[Op::upsert("a", vec![]).with_attr("size", price(1))]),
         Err(NamespaceError::SchemaCommitContention)
     );
-    assert_eq!(puts.load(SeqCst), 32 * 3);
+    assert_eq!(puts.load(SeqCst), SCHEMA_COMMIT_ATTEMPTS * 3);
     assert_eq!(wal_entries(&mem), 0);
 }
 
 /// Another writer commits a schema extension of its own right before each of our schema
-/// commits, so every try loses a real race. After `SCHEMA_COMMIT_ATTEMPTS` (32) lost races the
+/// commits, so every try loses a real race. After `SCHEMA_COMMIT_ATTEMPTS` lost races the
 /// write reports `SchemaCommitContention` and appends nothing; each lost race costs one create.
 #[test]
 fn schema_commit_contention_when_other_commits_keep_winning() {
@@ -1030,13 +1039,21 @@ fn schema_commit_contention_when_other_commits_keep_winning() {
         n.write(1, &[Op::upsert("a", vec![]).with_attr("size", price(1))]),
         Err(NamespaceError::SchemaCommitContention)
     );
-    assert_eq!(ours.load(SeqCst), 32, "one create per lost race");
+    assert_eq!(
+        ours.load(SeqCst),
+        SCHEMA_COMMIT_ATTEMPTS,
+        "one create per lost race"
+    );
     assert_eq!(
         latest_manifest(&mem).0.get(),
-        32,
+        SCHEMA_COMMIT_ATTEMPTS as u64,
         "every version is the other's"
     );
-    assert_eq!(wal_entries(&mem), 32, "only the other writer's batches");
+    assert_eq!(
+        wal_entries(&mem),
+        SCHEMA_COMMIT_ATTEMPTS,
+        "only the other writer's batches"
+    );
 }
 
 /// One refused create with nothing behind it does not fail a flush: the commit reads the key

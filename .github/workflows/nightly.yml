@@ -1,0 +1,31 @@
+name: Nightly fault injection
+
+# Runs the seeded fault-injection tests with many seeds. A failure prints the seed that
+# reproduces it ("fault-injection test failed with seed N"); rerun just that seed locally with
+# SEABED_FAULT_SEED=N cargo test --release -p seabed-engine.
+# Scheduled runs use the workflow file on the default branch and test develop.
+on:
+  schedule:
+    - cron: "23 17 * * *"
+  workflow_dispatch:
+    inputs:
+      seeds:
+        description: "Seeds per fault-injection test"
+        default: "1000"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  faults:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: develop
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: fault-injection tests
+        env:
+          SEABED_FAULT_SEEDS: ${{ github.event.inputs.seeds || '1000' }}
+        run: cargo test --release --workspace

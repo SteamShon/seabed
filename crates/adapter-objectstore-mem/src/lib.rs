@@ -5,7 +5,7 @@ mod fault;
 mod mem;
 
 pub use counting::{CountingObjectStore, RequestStats};
-pub use fault::{FaultConfig, FaultInjecting};
+pub use fault::{fault_seeds, CapturedStderr, FaultConfig, FaultInjecting, SeedOnPanic};
 pub use mem::MemObjectStore;
 
 use std::sync::{Mutex, MutexGuard};

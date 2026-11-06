@@ -22,6 +22,7 @@ use seabed_ports::{ObjectStore, PutCondition, StoreError};
 use crate::manifest_content::{ContentError, ManifestContent};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ManifestError {
     Store(StoreError),
     Unsupported(&'static str),
