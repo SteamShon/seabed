@@ -44,7 +44,7 @@ M0 결과가 "새로 만들지, 기여·재사용할지"를 정하므로, M2 이
 | Parquet SoT, namespace 속성 스키마(추가만) | ✅ | #11, #13 |
 | `Namespace` 쓰기 · flush · strong 읽기(WAL 꼬리 병합) | ✅ | #14 |
 | 쓰기 경로 재시도 예산 | ✅ | #16 |
-| 오류 enum `#[non_exhaustive]`, nightly 장애 주입(시드 1000개) | 🟡 nightly는 아직 GitHub에 등록되지 않음(workflow 조회 404, 2026-11-06). 기본 브랜치(main)에 들어간 뒤 수동 실행으로 확인 | #20 |
+| 오류 enum `#[non_exhaustive]`, nightly 장애 주입(시드 1000개) | ✅ #25 릴리스로 nightly가 등록됨. 수동 실행 1회 성공(run 42161199449, 시드 5, 2026-11-06). 예약 실행은 매일 17:23 UTC | #20, #25 |
 | 실제 S3 / S3 호환 에뮬레이터 어댑터와 conformance | ⬜ | |
 | SlateDB 어댑터와 conformance 비교 | ⬜ | |
 | 고아 SoT GC, WAL GC, 오래된 manifest 정리 · 체크포인트 | ⬜ | |
@@ -80,11 +80,10 @@ PLAN 7장의 "현재 상태" 문단에 있던 동작 설명을 옮기고, 리뷰
 1. M1: S3 호환 어댑터와 conformance (모든 결과의 전제)
 2. M0: 최소 하네스(recall, 비용)
 3. M2: 정적 빌드 설계 문서 → 구현
-4. 다음 릴리스(develop → main) 뒤 nightly를 수동 실행해 동작 확인 (#20, #21 리뷰 제안)
 
 ### 남은 작은 항목 (리뷰에서 "나중에")
 
-항목마다 (나온 PR, 그 리뷰 코멘트의 날짜 KST)를 붙입니다. 해결한 PR에서 지웁니다. 릴리스 때 문서 정리 PR이 한 릴리스 넘게 남은 항목을 처리합니다(CONTRIBUTING.md "릴리스" 1단계). #17부터 #23 리뷰 2차까지의 모든 라운드를 코드와 대조해 열린 항목을 모았습니다.
+항목마다 (나온 PR, 그 리뷰 코멘트의 날짜 KST)를 붙입니다. 해결한 PR에서 지웁니다. 릴리스 때 문서 정리 PR이 한 릴리스 넘게 남은 항목을 처리합니다(CONTRIBUTING.md "릴리스" 1단계). #17부터 #24 리뷰 2차까지의 모든 라운드를 코드와 대조해 열린 항목을 모았습니다.
 
 - `ManifestError::CommitConflict` 문서의 "다시 commit하면 알 수 있다"는 저장소가 그 키를 내줄 때만 성립 (#19, 2026-11-06)
 - 테스트 래퍼 `ScriptedVersions`의 "첫 GET"이 어느 키인지가 호출 순서에 달린다는 점을 주석에 적기 (#19, 2026-11-06)
@@ -105,3 +104,6 @@ PLAN 7장의 "현재 상태" 문단에 있던 동작 설명을 옮기고, 리뷰
 - CONTRIBUTING.md의 develop 커밋 찾는 법(`git log --grep`)이 본문 줄에도 걸림. 제목만 보게 하기 (#24, 2026-11-06)
 - `within()`의 Disconnected arm에 "catch_unwind가 항상 send하므로 보통 닿지 않음" 주석 (#24, 2026-11-06)
 - 저장소 ruleset에 `check`(ci.yml: fmt, clippy, test)를 필수 검사로 추가. 사용자 설정 (#24, 2026-11-06)
+- 릴리스 PR 판정에 같은 저장소인지 확인을 더하기(fork의 `develop` 브랜치 이름으로 검사를 건너뛰지 않게 `HEAD_REPO` 비교) (#24, 2026-11-06)
+- AGENTS.md "진행 상황 기록"의 릴리스 PR 문장을 문단 끝으로 옮기기 (#24, 2026-11-06)
+- workflow의 `actions/checkout@v4`가 Node.js 20 대상이라 경고가 남. 새 버전으로 올리기 (#25 실행 로그, 2026-11-06)
