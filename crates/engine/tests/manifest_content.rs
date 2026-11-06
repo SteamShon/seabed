@@ -5,7 +5,7 @@ use std::thread;
 use proptest::prelude::*;
 
 use seabed_adapter_objectstore_mem::{
-    CountingObjectStore, FaultConfig, FaultInjecting, MemObjectStore,
+    fault_seeds, CountingObjectStore, FaultConfig, FaultInjecting, MemObjectStore, SeedOnPanic,
 };
 use seabed_domain::{Lsn, NamespaceId, NamespaceKeys, TenantId};
 use seabed_engine::manifest::{ManifestError, ManifestStore};
@@ -622,7 +622,8 @@ fn open_ref_with_a_different_size_replacement_is_corrupt_not_ref_mismatch() {
 fn concurrent_commit_content_with_faults_keeps_successor_rules() {
     const WRITERS: u64 = 4;
     const PER_WRITER: u64 = 5;
-    for seed in 1..=10u64 {
+    for seed in fault_seeds(1..11) {
+        let _seed = SeedOnPanic(seed);
         let mem = Arc::new(MemObjectStore::new());
         let cfg = FaultConfig {
             seed,

@@ -73,6 +73,7 @@ const KEY_WRITER: &str = "seabed.sot.parquet_writer";
 const RESERVED: [&str; 4] = ["id", "lsn", "deleted", "vectors"];
 
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum SotError {
     Store(StoreError),
     AlreadyExists,

@@ -39,6 +39,7 @@ pub const MAX_NAME_LEN: usize = 255;
 pub const DATA_FILE: &str = "data.sbsg";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SegmentError {
     Store(StoreError),
     /// A segment already exists at this key. Segments are immutable.

@@ -7,7 +7,7 @@ use std::sync::atomic::Ordering::SeqCst;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 
 use seabed_adapter_objectstore_mem::{
-    CountingObjectStore, FaultConfig, FaultInjecting, MemObjectStore,
+    fault_seeds, CountingObjectStore, FaultConfig, FaultInjecting, MemObjectStore, SeedOnPanic,
 };
 use seabed_domain::{ETag, Key, NamespaceId, NamespaceKeys, TenantId, Version};
 use seabed_engine::manifest::{ManifestError, ManifestStore};
@@ -94,9 +94,16 @@ fn concurrent_commits_form_a_linear_history() {
 
 #[test]
 fn concurrent_commits_survive_injected_faults() {
+    for seed in fault_seeds(7..8) {
+        let _seed = SeedOnPanic(seed);
+        concurrent_commits_survive_injected_faults_with(seed);
+    }
+}
+
+fn concurrent_commits_survive_injected_faults_with(seed: u64) {
     let mem = Arc::new(MemObjectStore::new());
     let cfg = FaultConfig {
-        seed: 7,
+        seed,
         put_unavailable_ppm: 100_000,
         put_lose_response_ppm: 200_000,
         put_conflict_ppm: 50_000,

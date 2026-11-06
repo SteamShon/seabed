@@ -21,6 +21,7 @@ use crate::sot::{valid_attr_name, SotRef};
 pub const CONTENT_FORMAT_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ContentError {
     Decode(String),
     UnsupportedVersion(u32),

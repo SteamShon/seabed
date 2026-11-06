@@ -44,6 +44,7 @@ use crate::wal::{Wal, WalError};
 use crate::RetryPolicy;
 
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum NamespaceError {
     Wal(WalError),
     Manifest(ManifestError),
@@ -57,7 +58,7 @@ pub enum NamespaceError {
         reason: String,
     },
     /// `write` could not commit the schema extension its batch needs: every one of its
-    /// `SCHEMA_COMMIT_ATTEMPTS` (32) tries ended in `CommitConflict`. Nothing was appended, and
+    /// `SCHEMA_COMMIT_ATTEMPTS` tries ended in `CommitConflict`. Nothing was appended, and
     /// the batch may be retried later. Either other manifest commits kept landing first, or the
     /// store kept refusing the create with nothing behind it, in which case each try already
     /// spent a full write budget (see `Namespace::write`).
@@ -189,9 +190,9 @@ fn segment_fingerprint(schema: &AttrSchema, dims: u32) -> String {
         .collect()
 }
 
-/// Attempts at committing a schema extension before giving up (each loss is a real concurrent
-/// manifest commit).
-const SCHEMA_COMMIT_ATTEMPTS: usize = 32;
+/// Tries `Namespace::write` makes at committing a schema extension before it gives up with
+/// `NamespaceError::SchemaCommitContention`. Each try that is lost to another commit reloads.
+pub const SCHEMA_COMMIT_ATTEMPTS: usize = 32;
 
 /// Keeps, per document id, the row with the highest LSN. Tombstones are kept so they can hide
 /// older versions from earlier sources.
@@ -302,13 +303,14 @@ impl<S: ObjectStore> Namespace<S> {
     /// nothing was appended, and retrying is safe (the commit id comes from the content, and a
     /// reload finds the widened schema if that commit landed).
     ///
-    /// `SchemaCommitContention` means the schema commit lost every one of its 32 tries; nothing
+    /// `SchemaCommitContention` means the schema commit lost every one of its
+    /// `SCHEMA_COMMIT_ATTEMPTS` tries (32); nothing
     /// was appended. A lost race ends a try quickly. A store that keeps refusing the create with
     /// nothing behind it (a 409 that leaves no object) makes each try spend a whole write budget
     /// first. With the default policy that is about 2.3 s of backoff sleep per try (up to twice
     /// that with jitter), so such a write sleeps about 72 s in total (up to about 145 s) before
     /// it returns, plus the time of its requests: each try makes up to 8 creates and 8
-    /// read-backs, and reloads the manifest, about 600 requests over 32 tries. Pass a smaller
+    /// read-backs, and reloads the manifest, about 600 requests over all tries. Pass a smaller
     /// policy with `with_write_retry_policy` to fail faster.
     pub fn write(&self, request_id: u64, ops: &[Op]) -> Result<Lsn, NamespaceError> {
         if ops.is_empty() {

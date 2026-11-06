@@ -34,6 +34,48 @@ impl FaultConfig {
     }
 }
 
+/// Environment variable that widens fault-injection tests to many seeds (the nightly CI run
+/// sets it to 1000).
+pub const FAULT_SEEDS_ENV: &str = "SEABED_FAULT_SEEDS";
+
+/// Environment variable that runs fault-injection tests with exactly one seed, to reproduce a
+/// failure reported by `SeedOnPanic`.
+pub const FAULT_SEED_ENV: &str = "SEABED_FAULT_SEED";
+
+/// Seeds a fault-injection test runs with: `default` normally; the `N` seeds starting at
+/// `default.start` when `SEABED_FAULT_SEEDS=N` is set; only seed `S` when `SEABED_FAULT_SEED=S`
+/// is set (it wins). Pair each seed with a `SeedOnPanic` so a failure names the seed that
+/// reproduces it.
+pub fn fault_seeds(default: Range<u64>) -> Range<u64> {
+    if let Some(s) = env_number(FAULT_SEED_ENV) {
+        return s..s + 1;
+    }
+    match env_number(FAULT_SEEDS_ENV) {
+        Some(n) => default.start..default.start + n,
+        None => default,
+    }
+}
+
+fn env_number(name: &str) -> Option<u64> {
+    let v = std::env::var(name).ok()?;
+    Some(
+        v.trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("{name} must be a number, got {v:?}")),
+    )
+}
+
+/// Prints the seed if the test panics while this guard is alive.
+pub struct SeedOnPanic(pub u64);
+
+impl Drop for SeedOnPanic {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!("fault-injection test failed with seed {}", self.0);
+        }
+    }
+}
+
 struct Rng(u64);
 
 impl Rng {
