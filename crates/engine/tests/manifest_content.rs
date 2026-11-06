@@ -623,7 +623,7 @@ fn concurrent_commit_content_with_faults_keeps_successor_rules() {
     const WRITERS: u64 = 4;
     const PER_WRITER: u64 = 5;
     for seed in fault_seeds(1..11) {
-        let _seed = SeedOnPanic(seed);
+        let _seed = SeedOnPanic::new(seed);
         let mem = Arc::new(MemObjectStore::new());
         let cfg = FaultConfig {
             seed,

@@ -95,7 +95,7 @@ fn concurrent_commits_form_a_linear_history() {
 #[test]
 fn concurrent_commits_survive_injected_faults() {
     for seed in fault_seeds(7..8) {
-        let _seed = SeedOnPanic(seed);
+        let _seed = SeedOnPanic::new(seed);
         concurrent_commits_survive_injected_faults_with(seed);
     }
 }

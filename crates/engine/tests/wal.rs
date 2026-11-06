@@ -72,7 +72,7 @@ fn concurrent_appends_get_unique_contiguous_lsns() {
 #[test]
 fn lost_responses_do_not_duplicate_or_lose_entries() {
     for seed in fault_seeds(42..43) {
-        let _seed = SeedOnPanic(seed);
+        let _seed = SeedOnPanic::new(seed);
         lost_responses_do_not_duplicate_or_lose_entries_with(seed);
     }
 }

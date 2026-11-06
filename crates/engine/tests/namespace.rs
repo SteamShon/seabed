@@ -397,7 +397,7 @@ fn writes_racing_with_flushes_are_never_lost() {
 #[test]
 fn reads_and_flushes_survive_injected_faults() {
     for seed in fault_seeds(5..6) {
-        let _seed = SeedOnPanic(seed);
+        let _seed = SeedOnPanic::new(seed);
         reads_and_flushes_survive_injected_faults_with(seed);
     }
 }
@@ -1046,7 +1046,7 @@ fn schema_commit_contention_when_other_commits_keep_winning() {
     );
     assert_eq!(
         latest_manifest(&mem).0.get(),
-        32,
+        SCHEMA_COMMIT_ATTEMPTS as u64,
         "every version is the other's"
     );
     assert_eq!(

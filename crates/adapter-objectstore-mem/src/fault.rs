@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::ops::Range;
 use std::sync::Mutex;
 
@@ -46,32 +47,75 @@ pub const FAULT_SEED_ENV: &str = "SEABED_FAULT_SEED";
 /// `default.start` when `SEABED_FAULT_SEEDS=N` is set; only seed `S` when `SEABED_FAULT_SEED=S`
 /// is set (it wins). Pair each seed with a `SeedOnPanic` so a failure names the seed that
 /// reproduces it.
+///
+/// Panics on a value that is not a number, on `SEABED_FAULT_SEEDS=0`, and on a range past
+/// `u64::MAX`, so a bad setting can never pass by running no seed at all.
 pub fn fault_seeds(default: Range<u64>) -> Range<u64> {
-    if let Some(s) = env_number(FAULT_SEED_ENV) {
-        return s..s + 1;
+    let seed = std::env::var(FAULT_SEED_ENV).ok();
+    let seeds = std::env::var(FAULT_SEEDS_ENV).ok();
+    seeds_from(seed.as_deref(), seeds.as_deref(), default).unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// The decision behind `fault_seeds`, given the two variables' values.
+fn seeds_from(
+    seed: Option<&str>,
+    seeds: Option<&str>,
+    default: Range<u64>,
+) -> Result<Range<u64>, String> {
+    if let Some(v) = seed {
+        let s = parse_count(FAULT_SEED_ENV, v)?;
+        let end = s
+            .checked_add(1)
+            .ok_or_else(|| format!("{FAULT_SEED_ENV}={s} is too large"))?;
+        return Ok(s..end);
     }
-    match env_number(FAULT_SEEDS_ENV) {
-        Some(n) => default.start..default.start + n,
-        None => default,
+    let Some(v) = seeds else {
+        return Ok(default);
+    };
+    let n = parse_count(FAULT_SEEDS_ENV, v)?;
+    if n == 0 {
+        return Err(format!("{FAULT_SEEDS_ENV}=0 would run no seed"));
+    }
+    let end = default
+        .start
+        .checked_add(n)
+        .ok_or_else(|| format!("{FAULT_SEEDS_ENV}={n} runs past the largest seed"))?;
+    Ok(default.start..end)
+}
+
+fn parse_count(name: &str, v: &str) -> Result<u64, String> {
+    v.trim()
+        .parse()
+        .map_err(|_| format!("{name} must be a non-negative number, got {v:?}"))
+}
+
+/// Reports the seed if the test panics while this guard is alive. `new` writes to stderr;
+/// `with_output` takes another writer (for tests of the guard itself).
+pub struct SeedOnPanic<W: Write = std::io::Stderr> {
+    seed: u64,
+    out: W,
+}
+
+impl SeedOnPanic {
+    pub fn new(seed: u64) -> Self {
+        Self::with_output(seed, std::io::stderr())
     }
 }
 
-fn env_number(name: &str) -> Option<u64> {
-    let v = std::env::var(name).ok()?;
-    Some(
-        v.trim()
-            .parse()
-            .unwrap_or_else(|_| panic!("{name} must be a number, got {v:?}")),
-    )
+impl<W: Write> SeedOnPanic<W> {
+    pub fn with_output(seed: u64, out: W) -> Self {
+        Self { seed, out }
+    }
 }
 
-/// Prints the seed if the test panics while this guard is alive.
-pub struct SeedOnPanic(pub u64);
-
-impl Drop for SeedOnPanic {
+impl<W: Write> Drop for SeedOnPanic<W> {
     fn drop(&mut self) {
         if std::thread::panicking() {
-            eprintln!("fault-injection test failed with seed {}", self.0);
+            let _ = writeln!(
+                self.out,
+                "fault-injection test failed with seed {}",
+                self.seed
+            );
         }
     }
 }
@@ -177,5 +221,74 @@ impl<S: ObjectStore> ObjectStore for FaultInjecting<S> {
 
     fn delete(&self, key: &Key) -> Result<(), StoreError> {
         self.inner.delete(key)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn seeds_from_default_widen_single_and_precedence() {
+        assert_eq!(seeds_from(None, None, 7..8), Ok(7..8));
+        assert_eq!(seeds_from(None, Some("1000"), 7..8), Ok(7..1007));
+        assert_eq!(seeds_from(None, Some(" 3 "), 1..11), Ok(1..4), "trimmed");
+        assert_eq!(seeds_from(Some("500"), None, 7..8), Ok(500..501));
+        assert_eq!(
+            seeds_from(Some("500"), Some("1000"), 7..8),
+            Ok(500..501),
+            "one seed wins"
+        );
+    }
+
+    #[test]
+    fn seeds_from_rejects_zero_overflow_and_garbage() {
+        let max = u64::MAX.to_string();
+        for (seed, seeds) in [
+            (None, Some("0")),
+            (None, Some(max.as_str())),
+            (Some(max.as_str()), None),
+            (None, Some("")),
+            (None, Some("-1")),
+            (None, Some("abc")),
+            (Some("x"), Some("1000")),
+        ] {
+            assert!(
+                seeds_from(seed, seeds, 7..8).is_err(),
+                "{seed:?} {seeds:?} must be refused"
+            );
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct Shared(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Shared {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn seed_on_panic_reports_the_seed_only_when_panicking() {
+        let out = Shared::default();
+        drop(SeedOnPanic::with_output(8, out.clone()));
+        assert!(out.0.lock().unwrap().is_empty(), "silent without a panic");
+
+        let o = out.clone();
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _seed = SeedOnPanic::with_output(7, o);
+            panic!("injected failure");
+        }));
+        assert!(r.is_err());
+        assert_eq!(
+            String::from_utf8(out.0.lock().unwrap().clone()).unwrap(),
+            "fault-injection test failed with seed 7\n"
+        );
     }
 }
