@@ -100,12 +100,18 @@ cargo test --workspace
 
 ## 릴리스
 
-1. `develop`이 릴리스 가능한 상태인지 확인합니다.
-2. `develop` → `main` 릴리스 PR을 엽니다. 제목은 `release: vX.Y.Z` 또는 `release: <날짜 또는 마일스톤>` 형식입니다.
-3. 변경 요약(포함된 PR 목록)을 설명에 적습니다.
-4. **Merge commit**으로 머지합니다.
-5. 필요하면 `main`에 태그를 답니다.
-6. 릴리스 후 `main`의 변경(hotfix 등)은 `develop`에도 반영되어야 합니다. 반영 PR은 `develop`을 base로 합니다.
+1. **문서 정리 PR**을 먼저 develop에 넣습니다(일반 PR처럼 리뷰를 거칩니다). 정리할 것이 없으면 건너뜁니다.
+   - 직전 릴리스 뒤에 머지된 PR들의 마지막 리뷰 보고서에서, 아직 STATUS.md에 없는 "나중에" 항목을 모아 적습니다.
+   - STATUS.md의 "나중에" 항목 중 한 릴리스 넘게 남은 것은 지금 고치거나, GitHub 이슈로 옮기거나, 이유를 적고 지웁니다.
+   - STATUS.md에서 끝난 마일스톤의 상세 체크리스트는 한 줄 요약으로 접습니다.
+   - PLAN.md와 DECISIONS.md에서 해소된 [제안]·[가설]은 [결정]으로 바꾸거나 지우고, 현재 상태를 말하는 문장이 STATUS.md 밖에 생겼으면 STATUS.md로 옮깁니다.
+   - 지운 이유는 커밋 메시지에 남깁니다. 지운 내용은 git 이력에 남습니다.
+2. `develop`이 릴리스 가능한 상태인지 확인합니다.
+3. `develop` → `main` 릴리스 PR을 엽니다. 제목은 `release: vX.Y.Z` 또는 `release: <날짜 또는 마일스톤>` 형식입니다.
+4. 변경 요약(포함된 PR 목록)을 설명에 적습니다.
+5. **Merge commit**으로 머지합니다.
+6. 필요하면 `main`에 태그를 답니다.
+7. 릴리스 후 `main`의 변경(hotfix 등)은 `develop`에도 반영되어야 합니다. 반영 PR은 `develop`을 base로 합니다.
 
 ## 하지 않는 것
 

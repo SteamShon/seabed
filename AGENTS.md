@@ -15,7 +15,7 @@
 - PR의 base는 `develop`입니다. 사용자가 PR을 요청했을 때만 만듭니다.
 - `develop`으로 가는 일반 PR은 **Squash and merge**로 머지합니다.
 - **Umbrella PR**(여러 작업을 묶은 큰 기능 단위, 제목이나 설명에 명시됨)만 **Merge commit**으로 머지합니다.
-- `develop` → `main` **릴리스 PR**은 **Merge commit**으로 머지합니다.
+- `develop` → `main` **릴리스 PR**은 **Merge commit**으로 머지합니다. 릴리스 PR 전에 문서 정리 PR을 먼저 넣습니다(CONTRIBUTING.md "릴리스" 1단계).
 - PR 설명 마지막 줄에 다음 footer를 넣습니다.
   ```
   ---
