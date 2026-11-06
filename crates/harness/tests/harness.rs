@@ -1,20 +1,22 @@
-//! The harness end to end: recall bands on a synthetic dataset, and a monthly cost built from
-//! the engine's measured request counts.
+//! The harness end to end: recall bands on a synthetic dataset, the same run from vector files,
+//! correlated filters, and a monthly cost built from the engine's measured request counts.
 
 use std::sync::Arc;
 
 use seabed_adapter_objectstore_mem::{CountingObjectStore, MemObjectStore};
 use seabed_domain::{NamespaceId, NamespaceKeys, TenantId};
 use seabed_engine::namespace::{Namespace, Op};
+use seabed_harness::attrs;
 use seabed_harness::cost::{delta, monthly_cost, Prices, Workload};
-use seabed_harness::dataset::{Dataset, Filter, SyntheticSpec};
+use seabed_harness::dataset::{Dataset, Filter, Synthetic, SyntheticSpec};
 use seabed_harness::recall::{RecallReport, DEFAULT_BAND_EDGES};
 use seabed_harness::truth::{exact_knn, Metric};
+use seabed_harness::vecs::{read_fvecs, read_truth_ivecs, write_fvecs, write_ivecs};
 
 const K: usize = 10;
 
-fn dataset() -> Dataset {
-    Dataset::synthetic(&SyntheticSpec {
+fn synthetic() -> Synthetic {
+    let mut s = SyntheticSpec {
         n: 20_000,
         dims: 16,
         // Odd, so a document's cluster (id % clusters) does not follow its id's parity.
@@ -22,12 +24,25 @@ fn dataset() -> Dataset {
         spread: 0.3,
         attr_cardinality: 100_000,
         seed: 1,
-    })
+    }
+    .generate();
+    // The most selective filter keeps exactly one document (0.005%), independent of how the
+    // attribute stream happens to fall: document 0 gets 0, anything else below 6 moves up.
+    for (i, a) in s.data.attrs.iter_mut().enumerate() {
+        if i == 0 {
+            *a = 0;
+        } else if *a < 6 {
+            *a += 6;
+        }
+    }
+    assert_eq!(s.data.selectivity(FILTERS[0]), 1.0 / 20_000.0);
+    s
 }
 
 /// One filter per default band: about 0.005%, 0.05%, 0.5%, 5% and 100% of the documents.
 const FILTERS: [Filter; 5] = [
-    Filter::AttrBelow(5),
+    // `synthetic` pins exactly one document below 6, whatever the seed.
+    Filter::AttrBelow(6),
     Filter::AttrBelow(50),
     Filter::AttrBelow(500),
     Filter::AttrBelow(5_000),
@@ -35,12 +50,16 @@ const FILTERS: [Filter; 5] = [
 ];
 
 /// Runs `search` on every query and filter and reports recall per band.
-fn measure(data: &Dataset, search: impl Fn(&[f32], Filter) -> Vec<usize>) -> RecallReport {
+fn measure(
+    data: &Dataset,
+    queries: &[Vec<f32>],
+    search: impl Fn(&[f32], Filter) -> Vec<usize>,
+) -> RecallReport {
     let mut report = RecallReport::new(&DEFAULT_BAND_EDGES);
-    for q in data.queries(20, 2) {
+    for q in queries {
         for f in FILTERS {
-            let truth = exact_knn(data, &q, K, Metric::L2, f);
-            let got = search(&q, f);
+            let truth = exact_knn(data, q, K, Metric::L2, f);
+            let got = search(q, f);
             report.add_query(data.selectivity(f), &truth, &got, K);
         }
     }
@@ -49,8 +68,11 @@ fn measure(data: &Dataset, search: impl Fn(&[f32], Filter) -> Vec<usize>) -> Rec
 
 #[test]
 fn an_exact_search_passes_every_band() {
-    let data = dataset();
-    let report = measure(&data, |q, f| exact_knn(&data, q, K, Metric::L2, f));
+    let s = synthetic();
+    let data = &s.data;
+    let report = measure(data, &s.queries(20, 2), |q, f| {
+        exact_knn(data, q, K, Metric::L2, f)
+    });
     let bands = report.bands();
     assert_eq!(
         bands.len(),
@@ -59,6 +81,7 @@ fn an_exact_search_passes_every_band() {
     );
     assert!(bands.iter().all(|b| b.min == 1.0));
     assert!(report.meets(0.90));
+    assert!(report.unjudged_bands().is_empty());
 }
 
 /// A search that only sees half the documents (even ids, spread over every cluster) loses
@@ -66,14 +89,15 @@ fn an_exact_search_passes_every_band() {
 /// harness says so.
 #[test]
 fn a_search_that_misses_half_the_data_fails_the_criterion() {
-    let data = dataset();
+    let s = synthetic();
+    let data = &s.data;
     let mut half = data.clone();
     for (i, a) in half.attrs.iter_mut().enumerate() {
         if i % 2 == 1 {
             *a = u32::MAX; // never passes a filter
         }
     }
-    let report = measure(&data, |q, f| {
+    let report = measure(data, &s.queries(20, 2), |q, f| {
         let f = match f {
             Filter::None => Filter::AttrBelow(u32::MAX),
             f => f,
@@ -93,6 +117,84 @@ fn a_search_that_misses_half_the_data_fails_the_criterion() {
         assert!((0.3..0.7).contains(&b.mean), "{b:?}");
         assert!(b.p5 > 0.0, "{b:?}");
     }
+}
+
+/// The file workflow of the classic datasets: base vectors in `.fvecs`, ground truth in
+/// `.ivecs`. Written and read back here (in memory), the run gives the same report as the
+/// in-memory one.
+#[test]
+fn a_run_from_vector_files_matches_the_in_memory_run() {
+    let s = synthetic();
+    let queries = s.queries(10, 2);
+    let filter = Filter::AttrBelow(5_000);
+
+    let mut base = Vec::new();
+    write_fvecs(&mut base, &s.data.vectors).unwrap();
+    let mut query_file = Vec::new();
+    write_fvecs(&mut query_file, &queries).unwrap();
+    let truth: Vec<Vec<i32>> = queries
+        .iter()
+        .map(|q| {
+            exact_knn(&s.data, q, K, Metric::L2, filter)
+                .into_iter()
+                .map(|id| i32::try_from(id).unwrap())
+                .collect()
+        })
+        .collect();
+    let mut truth_file = Vec::new();
+    write_ivecs(&mut truth_file, &truth).unwrap();
+
+    let vectors = read_fvecs(&base[..], None).unwrap();
+    let loaded = Dataset::new(s.data.dims, vectors, s.data.attrs.clone()).unwrap();
+    assert_eq!(loaded, s.data);
+    let loaded_queries = read_fvecs(&query_file[..], None).unwrap();
+    let loaded_truth = read_truth_ivecs(&truth_file[..], None).unwrap();
+    assert_eq!(loaded_queries, queries);
+    for (q, t) in loaded_queries.iter().zip(&loaded_truth) {
+        assert_eq!(t, &exact_knn(&loaded, q, K, Metric::L2, filter));
+    }
+
+    // A search that returns the second half of the true top 10 only.
+    let mut from_files = RecallReport::new(&DEFAULT_BAND_EDGES);
+    let mut in_memory = RecallReport::new(&DEFAULT_BAND_EDGES);
+    for (q, t) in loaded_queries.iter().zip(&loaded_truth) {
+        let got = &t[K / 2..];
+        from_files.add_query(loaded.selectivity(filter), t, got, K);
+        let t2 = exact_knn(&s.data, q, K, Metric::L2, filter);
+        in_memory.add_query(s.data.selectivity(filter), &t2, &t2[K / 2..], K);
+    }
+    assert_eq!(from_files.bands(), in_memory.bands());
+    assert_eq!(from_files.weakest().unwrap().mean, 0.5);
+}
+
+/// Correlated attributes keep the filter's selectivity but put the passing documents in one
+/// region, so a typical query's filtered neighbours are much farther away: the case a
+/// cluster-pruning index must not miss.
+#[test]
+fn correlated_filters_push_filtered_neighbours_away() {
+    let s = synthetic();
+    let queries = s.queries(30, 2);
+    let filter = Filter::AttrBelow(1_000); // 1% of 100_000
+    let mean_nn_distance = |correlation: f64| -> (f64, f64) {
+        let mut data = s.data.clone();
+        data.attrs = attrs::correlated(&data.vectors, 100_000, correlation, 7);
+        let total: f64 = queries
+            .iter()
+            .map(|q| {
+                let nn = exact_knn(&data, q, 1, Metric::L2, filter)[0];
+                Metric::L2.distance(q, &data.vectors[nn]).sqrt()
+            })
+            .sum();
+        (data.selectivity(filter), total / queries.len() as f64)
+    };
+    let (sel_independent, independent) = mean_nn_distance(0.0);
+    let (sel_correlated, correlated) = mean_nn_distance(1.0);
+    assert!((sel_independent - 0.01).abs() < 0.003, "{sel_independent}");
+    assert_eq!(sel_correlated, 0.01);
+    assert!(
+        correlated > independent * 1.5,
+        "correlated {correlated} vs independent {independent}"
+    );
 }
 
 /// A strong read's measured requests, priced and scaled to a month. The counts match the

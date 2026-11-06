@@ -78,21 +78,10 @@ pub fn exact_knn(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dataset::SyntheticSpec;
     use proptest::prelude::*;
 
     fn tiny(vectors: Vec<Vec<f32>>, attrs: Vec<u32>) -> Dataset {
-        let mut d = Dataset::synthetic(&SyntheticSpec {
-            n: 0,
-            dims: vectors[0].len(),
-            clusters: 1,
-            spread: 1.0,
-            attr_cardinality: 10,
-            seed: 0,
-        });
-        d.vectors = vectors;
-        d.attrs = attrs;
-        d
+        Dataset::new(vectors[0].len(), vectors, attrs).unwrap()
     }
 
     #[test]
