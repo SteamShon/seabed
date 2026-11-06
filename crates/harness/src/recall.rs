@@ -173,6 +173,11 @@ mod tests {
         let w = r.weakest().unwrap();
         assert_eq!(w.upper, 0.0001);
         assert!(!r.meets(0.9));
+        // Exactly at the threshold passes ("at least").
+        let mut at = RecallReport::new(&[1.0]);
+        at.add(0.5, 0.5);
+        assert!(at.meets(0.5));
+        assert!(!at.meets(0.5 + 1e-9));
         // Ties go to the more selective band.
         let mut t = RecallReport::new(&DEFAULT_BAND_EDGES);
         t.add(0.5, 0.9);
