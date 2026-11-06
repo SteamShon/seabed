@@ -1,0 +1,16 @@
+[package]
+name = "seabed-adapter-objectstore-s3"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+[dependencies]
+seabed-domain = { path = "../domain" }
+seabed-ports = { path = "../ports" }
+object_store = { version = "0.14", features = ["aws"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "net"] }
+bytes = "1"
+
+[dev-dependencies]
+seabed-conformance = { path = "../conformance" }
+seabed-engine = { path = "../engine" }

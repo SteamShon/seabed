@@ -138,15 +138,26 @@ fn if_none_match_creates_once<S: ObjectStore>(s: &S) {
 fn if_match_semantics<S: ObjectStore>(s: &S) {
     let key = k("t/a/n/b/cas");
 
-    // S3 semantics: If-Match on a missing key fails with NotFound.
-    assert_eq!(
-        s.put(
+    // If-Match on a missing key fails: S3 answers NotFound, the HTTP spec (and R2, and the
+    // object_store S3 client) PreconditionFailed. Either is allowed (see `PutCondition`).
+    let missing = s
+        .put(
             &key,
             b"x".to_vec(),
-            PutCondition::IfMatch(ETag::new("\"nope\""))
+            PutCondition::IfMatch(ETag::new("\"nope\"")),
         )
-        .unwrap_err(),
-        StoreError::NotFound
+        .unwrap_err();
+    assert!(
+        matches!(
+            missing,
+            StoreError::NotFound | StoreError::PreconditionFailed
+        ),
+        "If-Match on a missing key: {missing:?}"
+    );
+    assert_eq!(
+        s.get(&key).unwrap_err(),
+        StoreError::NotFound,
+        "nothing was written"
     );
 
     let e1 = s

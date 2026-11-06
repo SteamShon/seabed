@@ -14,7 +14,10 @@ pub enum PutCondition {
     Unconditional,
     /// Create-only (`If-None-Match: *`).
     IfNoneMatch,
-    /// Compare-and-swap (`If-Match: <etag>`).
+    /// Compare-and-swap (`If-Match: <etag>`). On a missing key an adapter may report
+    /// `NotFound` (what S3 itself answers) or `PreconditionFailed` (what the HTTP spec and
+    /// R2 answer, and what the `object_store` S3 client turns S3's 404 into). Callers must
+    /// treat both as "the version I expected is not there".
     IfMatch(ETag),
 }
 
