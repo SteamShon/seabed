@@ -323,25 +323,31 @@ fn racing_flushes_of_the_same_range_commit_once_and_leave_no_divergent_files() {
         let hs: Vec<_> = (0..4).map(|_| sc.spawn(|| ns(&mem).flush())).collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
-    let committed = results.iter().filter(|r| matches!(r, Ok(Some(_)))).count();
+    // Flushes that start from the same manifest commit identical content, so they share a
+    // commit id: a loser that reads the winner's version back recognises it as its own commit
+    // (harmless, the content is the same). Either way, exactly one version is created.
+    let versions: BTreeSet<_> = results
+        .iter()
+        .filter_map(|r| r.as_ref().ok().and_then(|f| f.as_ref()).map(|f| f.version))
+        .collect();
+    // None of them fails: identical content means a shared commit id (more than one may report
+    // success), and a flush that starts after the commit finds nothing left to flush.
     for r in &results {
-        assert!(
-            matches!(
-                r,
-                Ok(Some(_))
-                    | Ok(None)
-                    | Err(NamespaceError::Manifest(ManifestError::CommitConflict))
-            ),
-            "unexpected {r:?}"
-        );
+        assert!(matches!(r, Ok(Some(_)) | Ok(None)), "unexpected {r:?}");
     }
-    assert_eq!(committed, 1, "exactly one flush commits");
+    assert_eq!(
+        versions.len(),
+        1,
+        "every successful flush reports the same version"
+    );
 
-    let (_, content) = ManifestStore::new(mem.clone(), keys())
+    let (latest, content) = ManifestStore::new(mem.clone(), keys())
         .unwrap()
         .load_latest_content()
         .unwrap()
         .unwrap();
+    assert_eq!(latest.get(), 1, "one manifest version");
+    assert_eq!(versions.into_iter().next(), Some(latest));
     assert_eq!(content.segments.len(), 1);
     // Same range, same id, same bytes: losers reused the winner's file instead of leaving
     // another one behind.
@@ -403,7 +409,8 @@ fn reads_and_flushes_survive_injected_faults() {
         DIMS,
     )
     .unwrap()
-    .with_retry_policy(RetryPolicy::immediate(64));
+    .with_retry_policy(RetryPolicy::immediate(64))
+    .with_write_retry_policy(RetryPolicy::immediate(64));
     for i in 0..10u64 {
         n.write(i, &[Op::upsert(&format!("d{i}"), vec![])]).unwrap();
         if i % 3 == 0 {
@@ -578,16 +585,21 @@ fn an_uncommitted_flush_does_not_block_a_later_flush_after_the_schema_grew() {
     n.write(1, &[Op::upsert("a", vec![]).with_attr("price", price(1))])
         .unwrap();
 
-    // Refuse the flush's commit as if another writer had committed first: the SoT file is
-    // written but never committed (same effect as dying before the commit).
+    // Right before the flush commits, another writer commits a new attribute (and crashes
+    // before appending it, so the WAL range stays 1..=1). The flush loses the race: its SoT file
+    // is written but never committed (same effect as dying before the commit). The next flush
+    // covers exactly the same range but must encode an extra column.
     let armed = Arc::new(AtomicBool::new(true));
-    let armed2 = armed.clone();
+    let (armed2, mem2) = (armed.clone(), mem.clone());
     hooked.on_put(move |key| {
         if is_manifest_version(key) && armed2.swap(false, SeqCst) {
-            PutAction::Fail(StoreError::PreconditionFailed)
-        } else {
-            PutAction::Pass
+            let ms = ManifestStore::new(mem2.clone(), keys()).unwrap();
+            let (v, mut c) = ms.load_latest_content().unwrap().unwrap();
+            c.extend_attr_schema(&[("color".to_string(), AttrKind::Str)].into_iter().collect())
+                .unwrap();
+            ms.commit_content(Some(v), 99, &c).unwrap();
         }
+        PutAction::Pass
     });
     assert_eq!(
         n.flush().unwrap_err(),
@@ -595,15 +607,6 @@ fn an_uncommitted_flush_does_not_block_a_later_flush_after_the_schema_grew() {
     );
     let orphan_files = segment_objects(&mem).len();
     assert_eq!(orphan_files, 1, "the abandoned flush left its SoT file");
-
-    // The schema grows WITHOUT a new WAL entry, so the next flush covers exactly the same range
-    // (1..=1) but must encode an extra column: as if a writer committed a new attribute and then
-    // crashed before appending.
-    let ms = ManifestStore::new(mem.clone(), keys()).unwrap();
-    let (v, mut c) = ms.load_latest_content().unwrap().unwrap();
-    c.extend_attr_schema(&[("color".to_string(), AttrKind::Str)].into_iter().collect())
-        .unwrap();
-    ms.commit_content(Some(v), 99, &c).unwrap();
 
     let f = n.flush().unwrap().unwrap();
     assert_eq!(
@@ -763,23 +766,29 @@ fn write_request_cost_is_pinned() {
 fn failed_append_after_schema_commit_keeps_the_type_and_retries_cleanly() {
     let mem = Arc::new(MemObjectStore::new());
     let hooked = Hooked::new(&mem);
-    let n = Namespace::new(hooked.clone(), keys(), DIMS).unwrap();
+    let n = Namespace::new(hooked.clone(), keys(), DIMS)
+        .unwrap()
+        .with_write_retry_policy(RetryPolicy::immediate(4));
     let wal_down = Arc::new(AtomicBool::new(true));
-    let down = wal_down.clone();
+    let wal_puts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (down, puts) = (wal_down.clone(), wal_puts.clone());
     let wal_prefix = keys().wal_prefix();
     hooked.on_put(move |key| {
         if key.as_str().starts_with(&wal_prefix) && down.load(SeqCst) {
+            puts.fetch_add(1, SeqCst);
             PutAction::Fail(unavailable())
         } else {
             PutAction::Pass
         }
     });
     let batch = [Op::upsert("a", vec![]).with_attr("size", AttrValue::Str("s".into()))];
-    // The WAL resolves each unclear put (NotFound) and tries the next one until it gives up.
+    // Each unclear put costs one try of the write retry budget; when it runs out the last
+    // failure is returned (the outcome of that put is unknown to the writer).
     assert_eq!(
         n.write(7, &batch),
-        Err(NamespaceError::Wal(WalError::TooManyAttempts))
+        Err(NamespaceError::Wal(WalError::Store(unavailable())))
     );
+    assert_eq!(wal_puts.load(SeqCst), 4, "4 tries, then give up");
     assert_eq!(wal_entries(&mem), 0);
 
     let (_, content) = latest_manifest(&mem);
@@ -864,4 +873,186 @@ fn schema_commit_store_error_is_returned_not_retried() {
     );
     assert_eq!(puts.load(SeqCst), 1, "not retried");
     assert_eq!(wal_entries(&mem), 0);
+}
+
+/// `Namespace::with_write_retry_policy` reaches the manifest and the SoT store too, not only the
+/// WAL: with those writes failing, `write` and `flush` give up after the configured tries.
+#[test]
+fn write_retry_policy_applies_to_manifest_commits_and_sot_writes() {
+    let mem = Arc::new(MemObjectStore::new());
+    let hooked = Hooked::new(&mem);
+    let n = Namespace::new(hooked.clone(), keys(), DIMS)
+        .unwrap()
+        .with_write_retry_policy(RetryPolicy::immediate(4));
+    let failing = Arc::new(Mutex::new(String::new()));
+    let puts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (f, p) = (failing.clone(), puts.clone());
+    hooked.on_put(move |key| {
+        let what = f.lock().unwrap().clone();
+        if !what.is_empty() && key.as_str().contains(what.as_str()) {
+            p.fetch_add(1, SeqCst);
+            PutAction::Fail(unavailable())
+        } else {
+            PutAction::Pass
+        }
+    });
+
+    // A new attribute needs a manifest commit first.
+    *failing.lock().unwrap() = keys().manifest_key(Version::new(1)).as_str().to_string();
+    assert_eq!(
+        n.write(1, &[Op::upsert("a", vec![]).with_attr("size", price(1))]),
+        Err(NamespaceError::Manifest(
+            ManifestError::Store(unavailable())
+        ))
+    );
+    assert_eq!(puts.swap(0, SeqCst), 4);
+
+    // Flushing needs a SoT write.
+    *failing.lock().unwrap() = "/segments/".to_string();
+    n.write(2, &[Op::upsert("b", vec![])]).unwrap();
+    assert_eq!(
+        n.flush(),
+        Err(NamespaceError::Sot(SotError::Store(unavailable())))
+    );
+    assert_eq!(puts.load(SeqCst), 4);
+}
+
+/// Two writers add the same attribute type from the same manifest version. Their widened
+/// contents are identical, so they share a commit id: the one that loses the create reads the
+/// winner's version back, takes it as its own commit and appends at once, without reloading.
+/// One schema version, two appends.
+#[test]
+fn same_type_schema_race_both_writers_succeed_with_one_version() {
+    let mem = Arc::new(MemObjectStore::new());
+    ns(&mem)
+        .write(
+            1,
+            &[Op::upsert("seed", vec![]).with_attr("price", price(1))],
+        )
+        .unwrap();
+    let (base, _) = latest_manifest(&mem);
+
+    let hooked = Hooked::new(&mem);
+    let loser = Namespace::new(hooked.clone(), keys(), DIMS).unwrap();
+    let ran = Arc::new(AtomicBool::new(false));
+    let (mem2, ran2) = (mem.clone(), ran.clone());
+    hooked.on_put(move |key| {
+        if is_manifest_version(key) && !ran2.swap(true, SeqCst) {
+            ns(&mem2)
+                .write(
+                    2,
+                    &[Op::upsert("w", vec![]).with_attr("size", AttrValue::Str("m".into()))],
+                )
+                .unwrap();
+        }
+        PutAction::Pass
+    });
+    let version_gets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gets = version_gets.clone();
+    hooked.on_get(move |key| {
+        if is_manifest_version(key) {
+            gets.fetch_add(1, SeqCst);
+        }
+    });
+    loser
+        .write(
+            3,
+            &[Op::upsert("l", vec![]).with_attr("size", AttrValue::Str("s".into()))],
+        )
+        .unwrap();
+    assert!(ran.load(SeqCst), "the race happened");
+
+    assert_eq!(
+        latest_manifest(&mem).0.get(),
+        base.get() + 1,
+        "one schema version"
+    );
+    assert_eq!(wal_entries(&mem), 3, "seed, winner, loser");
+    // Load (version + probe for a newer one), the successor check of the commit (the expected
+    // version again) and one read-back of the winner's version. A loser that took it for a
+    // conflict would reload: two more version GETs.
+    assert_eq!(version_gets.load(SeqCst), 4);
+}
+
+/// Every version create is refused with nothing behind it. A write that adds an attribute keeps
+/// reloading after each `CommitConflict`, so its cost is bounded by `SCHEMA_COMMIT_ATTEMPTS`
+/// (32) times the write budget, and it appends nothing.
+#[test]
+fn endless_empty_refusals_end_a_write_after_bounded_tries() {
+    let mem = Arc::new(MemObjectStore::new());
+    let hooked = Hooked::new(&mem);
+    let n = Namespace::new(hooked.clone(), keys(), DIMS)
+        .unwrap()
+        .with_write_retry_policy(RetryPolicy::immediate(3));
+    let puts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let p = puts.clone();
+    hooked.on_put(move |key| {
+        if is_manifest_version(key) {
+            p.fetch_add(1, SeqCst);
+            PutAction::Fail(StoreError::Conflict)
+        } else {
+            PutAction::Pass
+        }
+    });
+    assert_eq!(
+        n.write(1, &[Op::upsert("a", vec![]).with_attr("size", price(1))]),
+        Err(NamespaceError::Manifest(ManifestError::TooManyAttempts))
+    );
+    assert_eq!(puts.load(SeqCst), 32 * 3);
+    assert_eq!(wal_entries(&mem), 0);
+}
+
+/// One refused create with nothing behind it does not fail a flush: the commit reads the key
+/// back, finds nothing and tries again.
+#[test]
+fn flush_survives_one_empty_refusal() {
+    let mem = Arc::new(MemObjectStore::new());
+    let hooked = Hooked::new(&mem);
+    let n = Namespace::new(hooked.clone(), keys(), DIMS).unwrap();
+    n.write(1, &[Op::upsert("a", vec![])]).unwrap();
+    let armed = Arc::new(AtomicBool::new(true));
+    let a = armed.clone();
+    hooked.on_put(move |key| {
+        if is_manifest_version(key) && a.swap(false, SeqCst) {
+            PutAction::Fail(StoreError::Conflict)
+        } else {
+            PutAction::Pass
+        }
+    });
+    let f = n.flush().unwrap().expect("flushed");
+    assert!(!armed.load(SeqCst), "the refusal happened");
+    assert_eq!(f.version.get(), 1);
+    assert_eq!(ids(&n.read_all().unwrap()), ["a"]);
+}
+
+/// A write whose WAL append ends with the outcome unknown (the entry landed, the response was
+/// lost) can be retried with the same request id on the same `Namespace` without appending the
+/// batch twice.
+#[test]
+fn retrying_a_write_after_an_unknown_outcome_appends_it_once() {
+    let mem = Arc::new(MemObjectStore::new());
+    let hooked = Hooked::new(&mem);
+    let n = Namespace::new(hooked.clone(), keys(), DIMS)
+        .unwrap()
+        .with_write_retry_policy(RetryPolicy::immediate(1));
+    let down = Arc::new(AtomicBool::new(true));
+    let (d, wal_prefix) = (down.clone(), keys().wal_prefix());
+    hooked.on_put(move |key| {
+        if key.as_str().starts_with(&wal_prefix) && d.load(SeqCst) {
+            PutAction::ApplyThenFail(unavailable())
+        } else {
+            PutAction::Pass
+        }
+    });
+    let batch = [Op::upsert("a", vec![]).with_attr("size", price(1))];
+    assert_eq!(
+        n.write(7, &batch),
+        Err(NamespaceError::Wal(WalError::Store(unavailable())))
+    );
+    assert_eq!(wal_entries(&mem), 1, "the entry landed");
+
+    down.store(false, SeqCst);
+    assert_eq!(n.write(7, &batch).unwrap().get(), 1, "the retry found it");
+    assert_eq!(wal_entries(&mem), 1);
+    assert_eq!(ids(&n.read_all().unwrap()), ["a"]);
 }

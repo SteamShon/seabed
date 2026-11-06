@@ -48,15 +48,34 @@ pub struct Manifest {
     pub payload: Vec<u8>,
 }
 
+/// Tries for the best-effort pointer advance after a commit (capped by the write policy).
+pub const POINTER_RETRY_ATTEMPTS: usize = 2;
+
 /// The store is always wrapped in `Retrying`, so transient read failures (`get`, `list`) are
 /// retried with backoff without the caller having to remember it. Writes are not retried by the
 /// wrapper: `commit` resolves ambiguous put outcomes itself. Pass a `RetryPolicy` with
 /// `with_retry_policy` to change the read budget. `Retrying` does not implement `ObjectStore`, so
 /// passing an already-retrying store here does not compile.
+///
+/// Inside `commit`, transient failures (`Unavailable` from a put, or from a read-back that still
+/// fails after the read retries) are retried with backoff under the write retry policy
+/// (`with_write_retry_policy`). When it runs out, `commit` returns the last `Store(Unavailable)`
+/// error: the version may or may not have been created. Committing again with the same
+/// `expected` and `commit_id` resolves it: a refused create is always followed by reading the
+/// version back, so a commit that did land is recognised by its `commit_id`.
+///
+/// Advancing the pointer after a commit is best effort and gets at most
+/// `POINTER_RETRY_ATTEMPTS` tries of the same policy, so an already committed version is not
+/// held up by a pointer that cannot be written.
+///
+/// A create refused while nothing can be read at the key yet (a 409 that left no object, or a
+/// store that lists the key before serving it) is retried under the same budget, with backoff;
+/// when the budget runs out `commit` reports `CommitConflict`, so the caller reloads.
 pub struct ManifestStore<S: ObjectStore> {
     store: Retrying<Arc<S>>,
     keys: NamespaceKeys,
     max_attempts: usize,
+    write_policy: RetryPolicy,
 }
 
 impl<S: ObjectStore> ManifestStore<S> {
@@ -70,7 +89,15 @@ impl<S: ObjectStore> ManifestStore<S> {
             store: Retrying::new(store, RetryPolicy::default()),
             keys,
             max_attempts: 1_000,
+            write_policy: RetryPolicy::default(),
         })
+    }
+
+    /// Replaces the budget and backoff for transient failures inside `commit` (see the type
+    /// docs). The default is `RetryPolicy::default()`.
+    pub fn with_write_retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.write_policy = policy;
+        self
     }
 
     /// Replaces the read retry policy. `RetryPolicy::immediate(1)` disables read retries.
@@ -177,6 +204,11 @@ impl<S: ObjectStore> ManifestStore<S> {
     fn advance_pointer(&self, to: Version) -> Result<(), ManifestError> {
         let key = self.keys.manifest_pointer_key();
         let value = to.get().to_le_bytes().to_vec();
+        let mut budget = RetryPolicy {
+            max_attempts: self.write_policy.max_attempts.min(POINTER_RETRY_ATTEMPTS),
+            ..self.write_policy
+        }
+        .budget();
         for _ in 0..self.max_attempts {
             let cond = match self.read_pointer()? {
                 Some((cur, _)) if cur >= to => return Ok(()),
@@ -185,10 +217,10 @@ impl<S: ObjectStore> ManifestStore<S> {
             };
             match self.store.put(&key, value.clone(), cond) {
                 Ok(_) => return Ok(()),
-                // Lost a race, or the outcome is unknown: re-read and decide again.
-                Err(StoreError::PreconditionFailed)
-                | Err(StoreError::Conflict)
-                | Err(StoreError::Unavailable(_)) => {}
+                // Lost a race: re-read and decide again.
+                Err(StoreError::PreconditionFailed) | Err(StoreError::Conflict) => {}
+                // Outcome unknown: back off, then re-read and decide again.
+                Err(e @ StoreError::Unavailable(_)) => budget.retry_or(e)?,
                 Err(e) => return Err(e.into()),
             }
         }
@@ -246,30 +278,28 @@ impl<S: ObjectStore> ManifestStore<S> {
         entry.extend_from_slice(payload);
 
         let key = self.keys.manifest_key(next);
-        // True once an attempt had an unknown outcome: that attempt may have landed.
-        let mut maybe_landed = false;
+        let mut budget = self.write_policy.budget();
         for _ in 0..self.max_attempts {
             let outcome = self
                 .store
                 .put(&key, entry.clone(), PutCondition::IfNoneMatch);
-            let ambiguous = matches!(outcome, Err(StoreError::Unavailable(_)));
+            // The transient failure this round, if any; it costs one retry from `budget`.
+            let mut transient = match &outcome {
+                Err(e @ StoreError::Unavailable(_)) => Some(e.clone()),
+                _ => None,
+            };
             let rejected = matches!(
                 outcome,
                 Err(StoreError::PreconditionFailed) | Err(StoreError::Conflict)
             );
             match outcome {
                 Ok(_) => return Ok(next),
-                Err(e) if !ambiguous && !rejected => return Err(e.into()),
+                Err(e) if transient.is_none() && !rejected => return Err(e.into()),
                 Err(_) => {}
             }
-            if rejected && !maybe_landed {
-                return Err(ManifestError::CommitConflict);
-            }
-            if ambiguous {
-                maybe_landed = true;
-            }
-            // Either this attempt or an earlier one has an unknown outcome:
-            // find out whether the object at `key` is ours.
+            // The outcome is unknown, or the version exists. It may be ours: this attempt or an
+            // earlier one may have landed, including one from an earlier `commit` call that gave
+            // up with `Unavailable`. Read it back and compare commit ids.
             match self.store.get(&key) {
                 Ok((bytes, _)) => {
                     return if bytes.len() >= 8 && bytes[..8] == id_bytes {
@@ -278,8 +308,15 @@ impl<S: ObjectStore> ManifestStore<S> {
                         Err(ManifestError::CommitConflict)
                     };
                 }
-                Err(StoreError::NotFound) | Err(StoreError::Unavailable(_)) => {}
+                Err(StoreError::NotFound) => {}
+                Err(e @ StoreError::Unavailable(_)) => transient = Some(e),
                 Err(e) => return Err(e.into()),
+            }
+            if let Some(e) = transient {
+                budget.retry_or(e)?;
+            } else if rejected {
+                // Refused, yet nothing is there to compare: try again after a backoff.
+                budget.retry_or(ManifestError::CommitConflict)?;
             }
         }
         Err(ManifestError::TooManyAttempts)

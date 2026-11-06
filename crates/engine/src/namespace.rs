@@ -237,6 +237,16 @@ impl<S: ObjectStore> Namespace<S> {
         self
     }
 
+    /// Replaces the write retry policy of every store this namespace uses: the budget and
+    /// backoff for transient failures while appending to the WAL, committing a manifest and
+    /// writing a SoT file. Losing a race to another writer is not limited by it.
+    pub fn with_write_retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.wal = self.wal.with_write_retry_policy(policy);
+        self.manifests = self.manifests.with_write_retry_policy(policy);
+        self.sots = self.sots.with_write_retry_policy(policy);
+        self
+    }
+
     fn latest(&self) -> Result<(Option<Version>, ManifestContent), NamespaceError> {
         Ok(match self.manifests.load_latest_content()? {
             Some((v, c)) => (Some(v), c),
@@ -270,8 +280,21 @@ impl<S: ObjectStore> Namespace<S> {
     /// commits a different type first makes this write fail with `Invalid` after a reload.
     ///
     /// A write that fails after the schema commit (for example the WAL append fails) still leaves
-    /// its new attributes in the schema: their types stay reserved. Retrying with the same
-    /// `request_id` is safe.
+    /// its new attributes in the schema: their types stay reserved.
+    ///
+    /// `Wal(Store(Unavailable))` means the write retry budget ran out with the append's outcome
+    /// unknown: the batch may or may not be in the WAL. `request_id` names one logical write:
+    /// use a fresh one for each new write, and reuse it only to retry that write with the same
+    /// ops (the same id and ops count as the same write). Retrying the same batch with the same
+    /// `request_id` on the same `Namespace` is safe, also from several threads at once: the WAL
+    /// checks where the earlier attempt may have landed and returns that LSN if it did (batches
+    /// encode deterministically, and only an identical entry counts as this batch). A retry
+    /// from another process or `Namespace`, or after a restart, may still append the batch twice
+    /// (harmless for a lone writer; another writer's update to the same ids in between would be
+    /// overwritten).
+    /// `Manifest(Store(Unavailable))` means the same for the schema commit before the append:
+    /// nothing was appended, and retrying is safe (the commit id comes from the content, and a
+    /// reload finds the widened schema if that commit landed).
     pub fn write(&self, request_id: u64, ops: &[Op]) -> Result<Lsn, NamespaceError> {
         if ops.is_empty() {
             return Err(NamespaceError::Invalid(SotError::Format(
@@ -315,6 +338,8 @@ impl<S: ObjectStore> Namespace<S> {
     ///
     /// Fails with `Manifest(CommitConflict)` if another manifest commit landed first (another
     /// flush, or a write adding attributes); call again to flush whatever is still unindexed.
+    /// Flushes racing from the same manifest over the same WAL range commit identical content
+    /// (same commit id), so they all succeed and report the one version that was created.
     pub fn flush(&self) -> Result<Option<Flushed>, NamespaceError> {
         let (expected, mut content) = self.latest()?;
         let (tail, last) = self.tail(&content)?;
