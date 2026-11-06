@@ -8,7 +8,7 @@ turbopuffer처럼 싸고 운영이 단순하면서, 오픈소스이고 큰 names
 > | 구분 | 상태 |
 > | --- | --- |
 > | 설계 문서 (요구사항, 아키텍처, 평가 계획) | 있음 → [docs/PLAN.md](docs/PLAN.md), [docs/DECISIONS.md](docs/DECISIONS.md) |
-> | 코드 | M1 골격만 있음: ObjectStore 포트와 메모리 어댑터, 단일 노드 WAL, manifest 커밋, conformance 테스트 |
+> | 코드 | M1 저장 primitive의 기능 범위(쓰기, flush, strong 읽기)가 메모리 어댑터 위에서 동작. 마일스톤별 상태 → [docs/STATUS.md](docs/STATUS.md) |
 > | 벡터 인덱스, 필터링, BM25, 분산, API | 계획만 있고 구현하지 않음 |
 
 ---

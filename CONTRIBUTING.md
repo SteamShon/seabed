@@ -43,6 +43,10 @@ cargo test --workspace
 - `rust-toolchain.toml`이 stable 채널과 `rustfmt`, `clippy` 컴포넌트를 지정하므로 rustup이 자동으로 설치합니다.
 - 포맷만 바꾸는 변경은 기능 변경과 섞지 않고 별도 커밋으로 둡니다.
 
+## 진행 상황 기록
+
+마일스톤별 진행 상황과 리뷰에서 "나중에"로 남은 항목은 [docs/STATUS.md](docs/STATUS.md)에 둡니다. 갱신 규칙은 [AGENTS.md](AGENTS.md)의 "진행 상황 기록"과 같습니다.
+
 ## 커밋
 
 - 제목은 `<종류>: <요약>` 형식을 씁니다. 종류는 `feat`, `fix`, `docs`, `refactor`, `test`, `chore` 중 하나입니다.
