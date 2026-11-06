@@ -147,6 +147,23 @@ mod tests {
         assert!((s - 0.1).abs() < 0.01, "{s}");
     }
 
+    /// Queries come from every cluster, not one: each lands nearest its own centre, and 200
+    /// of them reach all 10 centres.
+    #[test]
+    fn queries_spread_over_the_clusters() {
+        let d = Dataset::synthetic(&spec());
+        let dist =
+            |a: &[f32], b: &[f32]| -> f32 { a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum() };
+        let mut hit = [false; 10];
+        for q in d.queries(200, 9) {
+            let nearest = (0..10)
+                .min_by(|i, j| dist(&q, &d.centres[*i]).total_cmp(&dist(&q, &d.centres[*j])))
+                .unwrap();
+            hit[nearest] = true;
+        }
+        assert!(hit.iter().all(|h| *h), "{hit:?}");
+    }
+
     #[test]
     fn documents_sit_near_their_centre() {
         let d = Dataset::synthetic(&spec());
