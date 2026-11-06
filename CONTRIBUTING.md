@@ -45,7 +45,7 @@ cargo test --workspace
 
 ## 진행 상황 기록
 
-마일스톤별 진행 상황과 리뷰에서 "나중에"로 남은 항목은 [docs/STATUS.md](docs/STATUS.md)에 둡니다. 갱신 규칙은 [AGENTS.md](AGENTS.md)의 "진행 상황 기록"과 같습니다.
+마일스톤별 진행 상황과 리뷰에서 "나중에"로 남은 항목은 [docs/STATUS.md](docs/STATUS.md)에 둡니다. 갱신 규칙은 [AGENTS.md](AGENTS.md)의 "진행 상황 기록"과 같습니다. CI가 갱신을 빼먹은 PR을 잡습니다. 고칠 줄이 없으면 PR 본문에 `STATUS: 해당 없음 — <이유>`를 적습니다.
 
 ## 커밋
 
