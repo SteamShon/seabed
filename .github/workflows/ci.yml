@@ -23,3 +23,34 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: test
         run: cargo test --workspace
+
+  s3:
+    # The S3 adapter's conformance and engine tests against moto, a local S3 emulator that
+    # honors If-None-Match and If-Match on PUT.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: start moto
+        run: |
+          pip install "moto[server]==5.2.5"
+          moto_server -p 5055 > "$RUNNER_TEMP/moto.log" 2>&1 &
+          for _ in $(seq 1 60); do curl -s -o /dev/null http://127.0.0.1:5055/ && break; sleep 1; done
+          python - <<'PY'
+          import boto3
+          boto3.client("s3", endpoint_url="http://127.0.0.1:5055", aws_access_key_id="test",
+                       aws_secret_access_key="test", region_name="us-east-1").create_bucket(Bucket="seabed-test")
+          PY
+      - name: S3 adapter tests
+        env:
+          SEABED_S3_ENDPOINT: http://127.0.0.1:5055
+          SEABED_S3_REQUIRED: "1"
+        run: cargo test -p seabed-adapter-objectstore-s3
+      - name: moto log on failure
+        if: failure()
+        run: tail -n 100 "$RUNNER_TEMP/moto.log"

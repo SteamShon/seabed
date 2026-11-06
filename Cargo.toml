@@ -6,5 +6,6 @@ members = [
     "crates/adapter-objectstore-mem",
     "crates/adapter-objectstore-retry",
     "crates/engine",
+    "crates/adapter-objectstore-s3",
     "crates/conformance",
 ]
