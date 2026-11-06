@@ -21,7 +21,9 @@ jobs:
       - name: check script cases
         run: .github/scripts/status-check-test.sh
       - name: changed files
-        run: git diff --name-only "origin/${{ github.base_ref }}...HEAD" > "$RUNNER_TEMP/changed.txt"
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: .github/scripts/status-changed-files.sh "origin/$BASE_REF" > "$RUNNER_TEMP/changed.txt"
       - name: STATUS.md updated or exempted
         env:
           PR_BODY: ${{ github.event.pull_request.body }}
