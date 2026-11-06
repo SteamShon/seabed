@@ -15,7 +15,7 @@
 - PR의 base는 `develop`입니다. 사용자가 PR을 요청했을 때만 만듭니다.
 - `develop`으로 가는 일반 PR은 **Squash and merge**로 머지합니다.
 - **Umbrella PR**(여러 작업을 묶은 큰 기능 단위, 제목이나 설명에 명시됨)만 **Merge commit**으로 머지합니다.
-- `develop` → `main` **릴리스 PR**은 **Merge commit**으로 머지합니다.
+- `develop` → `main` **릴리스 PR**은 **Merge commit**으로 머지합니다. 릴리스 PR 전에 문서 정리 PR을 먼저 넣습니다(CONTRIBUTING.md "릴리스" 1단계).
 - PR 설명 마지막 줄에 다음 footer를 넣습니다.
   ```
   ---
@@ -50,6 +50,12 @@
 - push와 PR 전에 `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`를 모두 통과시킵니다. CI도 같은 검사를 합니다.
 - 포맷은 rustfmt 기본값(`rustfmt.toml`)입니다. 설정을 임의로 바꾸지 않습니다.
 - 포맷만 바뀐 변경은 기능 변경과 다른 커밋으로 둡니다.
+
+## 진행 상황 기록
+
+- [docs/STATUS.md](docs/STATUS.md)의 어떤 줄이 PR 때문에 틀리게 되면 같은 PR에서 고칩니다. 종류(feat, fix, test, chore, docs)와 상관없이 결과로 판단합니다. 항목 추가, 상태 변경, "나중에" 항목의 해결(목록에서 지움)이 모두 해당합니다.
+- 리뷰에서 "나중에"로 남은 항목은 리뷰 반영 커밋을 만들 때 그 커밋에 함께 적습니다. 마지막 리뷰 라운드에서 나온 것(그 뒤 커밋이 없는 것)은 다음에 STATUS.md를 고치는 PR에서 적습니다. 이것만을 위해 head를 바꾸지 않습니다.
+- CI(`.github/workflows/status.yml`)는 `crates/`, `.github/`, `Cargo.toml`, `Cargo.lock`을 바꾸고 STATUS.md를 바꾸지 않은 PR을 실패시킵니다. 고칠 줄이 없으면 PR 본문에 `STATUS: 해당 없음 — <이유>` 한 줄을 적습니다. `develop` → `main` 릴리스 PR은 이 검사를 바로 통과합니다(담긴 PR이 이미 develop에서 검사를 거쳤기 때문). 이유가 맞는지는 리뷰어가 봅니다.
 
 ## 커밋
 

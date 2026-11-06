@@ -1,0 +1,32 @@
+name: STATUS check
+
+# Separate from ci.yml so that editing the PR body (to add the exemption line) reruns only
+# this check, not the whole build.
+on:
+  pull_request:
+    branches: [develop, main]
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  status:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: check script cases
+        run: .github/scripts/status-check-test.sh
+      - name: changed files
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: .github/scripts/status-changed-files.sh "origin/$BASE_REF" > "$RUNNER_TEMP/changed.txt"
+      - name: STATUS.md updated or exempted
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_REF: ${{ github.head_ref }}
+        run: .github/scripts/status-check.sh "$RUNNER_TEMP/changed.txt"

@@ -47,6 +47,7 @@ use seabed_ports::{ObjectStore, PutCondition, StoreError};
 use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum WalError {
     Store(StoreError),
     Unsupported(&'static str),

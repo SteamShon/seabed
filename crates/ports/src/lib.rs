@@ -19,6 +19,7 @@ pub enum PutCondition {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum StoreError {
     NotFound,
     /// HTTP 412: the precondition did not hold.

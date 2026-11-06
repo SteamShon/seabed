@@ -113,7 +113,7 @@ v0.5 · 2026-11-04 · 대화에서 합의한 내용 기준. v0.5는 계획 리�
 - **인제스트 정책(namespace별 설정) [제안]:** 가시성 목표, 그룹 커밋 윈도우, 꼬리 상한, 인덱스 빌드 트리거, 우선순위. 프리셋 realtime / balanced / bulk. bulk는 꼬리 검색을 끄고 끝나면 manifest를 교체해 한 번에 공개.
 - **경로 자동 선택 [제안]:** 변경 비율을 측정해(배치는 시작 전에 키와 해시 컬럼 스캔, 스트리밍은 이동 평균) 파티션 단위로 증분 / 부분 재빌드 / 전체 재빌드를 고른다. 견적은 시간과 비용 범위(가장 싼 안, 균형 안, 가장 빠른 안), 마감 시간·비용 상한·최대 워커 수로 조정. 작업은 파티션 단위 멱등 태스크라 실행 중 워커 증감과 재시도가 가능.
 - 메타데이터만 바뀌면 속성 인덱스만 갱신하고 벡터 클러스터는 건드리지 않는다. 컴팩션과 빌드는 별도 워커.
-- **strong 읽기의 비용 [제안]:** strong은 쿼리마다 최신 manifest를 확인해야 한다. 현재 M1 구현의 `load_latest`는 manifest prefix 전체를 LIST하므로 버전이 쌓일수록 느려지고 요청 비용이 늘어난다. 최신 버전을 가리키는 포인터 객체(`If-Match` 갱신) 또는 주기적 체크포인트와 오래된 버전 정리가 필요하다. 쿼리 노드는 짧은 TTL로 최신 버전을 캐시하고, 쓰기 응답의 LSN 토큰(min_lsn)으로 필요할 때만 강제 확인한다.
+- **strong 읽기의 비용 [제안]:** strong은 쿼리마다 최신 manifest를 확인해야 한다. manifest prefix 전체를 LIST하면 버전이 쌓일수록 느려지므로, 최신 버전을 가리키는 포인터 객체(`If-Match` 전진 + 앞으로 탐색)를 쓴다(구현 상태는 STATUS.md). 주기적 체크포인트와 오래된 버전 정리도 필요하다. 쿼리 노드는 짧은 TTL로 최신 버전을 캐시하고, 쓰기 응답의 LSN 토큰(min_lsn)으로 필요할 때만 강제 확인한다.
 
 ### 6.5 저장 포맷 [제안, memvid 참고]
 
@@ -163,7 +163,7 @@ v0.5 · 2026-11-04 · 대화에서 합의한 내용 기준. v0.5는 계획 리�
 
 **최소 검증 경로 [제안]:** 혼자 개발하는 규모를 고려해, 가설 검증에 꼭 필요한 M1 → M2(정적 빌드) → M3(필터 플래너) → M4(bulk 분리) → M4.5를 먼저 끝낸다. BM25/한국어, OLAP 노출, FDE, 증분 클러스터 갱신의 고도화는 그 뒤로 미룰 수 있다.
 
-현재 상태: M1의 일부(ObjectStore 포트와 메모리 어댑터, 장애 주입, WAL, manifest 커밋, conformance)만 코드가 있다. 2026-11-04 기준 `cargo test --workspace`가 컴파일되고 모든 테스트가 통과한다. 최신 manifest 포인터(`If-Match` 전진 + 앞으로 탐색, 읽기 GET 약 3회)가 있다. segment 포맷과 타입이 있는 manifest 내용(segment 목록, `indexed_through`, `IndexBinding`)이 있다. Parquet SoT 파일(쓰기·읽기·검증)과, 이를 manifest에 연결하는 segment 참조(`docs` 필수, `index` 선택)와 namespace 속성 스키마가 있다. `Namespace`가 쓰기(WAL 레코드 v1: upsert/delete 묶음, 쓰기 전에 검증), flush(WAL 꼬리 → segment SoT → manifest 커밋), strong 읽기(모든 segment + `indexed_through` 이후 WAL 꼬리를 LSN이 가장 큰 행으로 병합, tombstone 반영)를 제공한다. 이로써 M1의 기능 범위는 채워졌다. 새 속성은 write가 WAL에 붙이기 전에 스키마를 넓힌 manifest를 먼저 커밋하므로, 타입 충돌은 순차든 경합이든 항상 write에서 거부되고 flush가 막히지 않는다. WAL 레코드는 `float_roundtrip`으로 f32·f64를 비트 그대로 보존한다. 쓰기 경로(WAL append, manifest 커밋, SoT 쓰기)의 일시 장애(`Unavailable`)는 쓰기 재시도 정책(`RetryPolicy`, 기본 8회, 20 ms에서 1 s까지 지수 백오프와 jitter)으로 다시 시도하고, 다 쓰면 마지막 `Unavailable`을 돌려준다(결과 모름). 다른 writer에게 진 경합은 이 예산을 쓰지 않는다. manifest는 거절된 생성 뒤 항상 버전을 다시 읽어 commit id를 비교하므로, 결과 모름 뒤 같은 commit을 다시 시도하면 이미 들어간 자기 버전을 알아본다(같은 내용의 동시 commit도 같은 id라 함께 성공한다). 커밋 뒤 best-effort 포인터 전진은 최대 2회만 시도한다. `Namespace::with_write_retry_policy`로 세 곳을 한 번에 바꾼다. 남은 것: 고아 SoT GC, 결과 모름 뒤 재시도의 중복 방지는 같은 `Wal`(같은 `Namespace`) 안에서만 된다(결과 모름으로 끝난 append의 후보 LSN을 `request_id`와 항목 해시별로 기억했다가 재시도 때 먼저 읽어 보고, 항목 전체가 같을 때만 자기 것으로 봄. 재시도가 성공하면 그 LSN을 기억하고, 같은 id의 append는 한 번에 하나씩 돌아 동시 재시도도 한 번만 붙음. 최대 `MAX_PENDING`개, 오래된 것부터 잊음). 다른 프로세스나 재시작 뒤의 재시도는 여전히 두 번 붙일 수 있어 저장소에 남는 멱등성 색인이 필요하다, 읽기 때마다 모든 segment와 꼬리를 다 읽는 비용(strong 읽기 1회에 manifest GET 3 + segment마다 GET 1 + WAL LIST 1 + 꼬리 항목마다 GET 1, 테스트로 고정; 인덱스는 M2부터), WAL GC는 읽을 수 있는 모든 manifest의 `indexed_through` 이하만 지울 수 있다.
+현재 상태: 마일스톤별로 무엇이 됐고 무엇이 남았는지는 [STATUS.md](STATUS.md)에 적는다. 요약(2026-11-06): M1은 기능 범위(쓰기 · flush · strong 읽기, 쓰기 재시도, 같은 인스턴스 안의 재시도 중복 방지)가 메모리 어댑터 위에서 완료됐고, 실제 S3 호환 어댑터와 GC, 프로세스 간 멱등성은 남았다. M0는 판정 기준만 있고, M2 이후는 시작 전이다.
 
 ## 8. 평가(M0) 요약
 
