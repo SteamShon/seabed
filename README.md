@@ -132,6 +132,7 @@ crates/
   adapter-objectstore-retry/ 읽기 일시 오류를 backoff로 재시도하는 데코레이터 (backon)
   engine/                  WAL(LSN 선점), manifest 커밋
   conformance/             어떤 ObjectStore 어댑터에도 돌리는 공통 테스트
+  harness/                 M0 평가 하네스: 합성 데이터, 정답 kNN, recall 구간, 비용 모델
 docs/
   PLAN.md                  프로젝트 계획 (요구사항, 아키텍처, 마일스톤, 열린 질문)
   DECISIONS.md             결정 기록 ([결정]/[제안]/[미정] 구분)

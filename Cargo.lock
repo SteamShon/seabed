@@ -1696,6 +1696,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "seabed-harness"
+version = "0.0.1"
+dependencies = [
+ "proptest",
+ "seabed-adapter-objectstore-mem",
+ "seabed-domain",
+ "seabed-engine",
+]
+
+[[package]]
 name = "seabed-ports"
 version = "0.0.1"
 dependencies = [

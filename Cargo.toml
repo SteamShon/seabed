@@ -8,4 +8,5 @@ members = [
     "crates/engine",
     "crates/adapter-objectstore-s3",
     "crates/conformance",
+    "crates/harness",
 ]
