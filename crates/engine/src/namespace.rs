@@ -305,9 +305,11 @@ impl<S: ObjectStore> Namespace<S> {
     /// `SchemaCommitContention` means the schema commit lost every one of its 32 tries; nothing
     /// was appended. A lost race ends a try quickly. A store that keeps refusing the create with
     /// nothing behind it (a 409 that leaves no object) makes each try spend a whole write budget
-    /// first, so with the default policy (about 2.3 s of backoff per budget, up to twice that
-    /// with jitter) such a write returns only after about 72 s, at most about 145 s. Pass a
-    /// smaller policy with `with_write_retry_policy` to fail faster.
+    /// first. With the default policy that is about 2.3 s of backoff sleep per try (up to twice
+    /// that with jitter), so such a write sleeps about 72 s in total (up to about 145 s) before
+    /// it returns, plus the time of its requests: each try makes up to 8 creates and 8
+    /// read-backs, and reloads the manifest, about 600 requests over 32 tries. Pass a smaller
+    /// policy with `with_write_retry_policy` to fail faster.
     pub fn write(&self, request_id: u64, ops: &[Op]) -> Result<Lsn, NamespaceError> {
         if ops.is_empty() {
             return Err(NamespaceError::Invalid(SotError::Format(

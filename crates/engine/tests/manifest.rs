@@ -670,10 +670,13 @@ fn unavailable_then_stale_refusals_report_conflict_and_a_retry_recognises_the_co
 }
 
 /// Before our first pointer put, `race` (if set) makes another writer write that value to the
-/// pointer, so the put's `If-Match` etag is stale. Counts pointer puts, ours only.
+/// pointer, and our put is then refused with `refusal`: `PreconditionFailed` (stale `If-Match`
+/// etag) or `Conflict` (a store that answers a lost race with 409). Counts pointer puts, ours
+/// only.
 struct PointerRace {
     inner: MemObjectStore,
     race: std::sync::Mutex<Option<u64>>,
+    refusal: StoreError,
     pointer_puts: AtomicUsize,
 }
 
@@ -698,6 +701,7 @@ impl ObjectStore for PointerRace {
                         PutCondition::Unconditional,
                     )
                     .unwrap();
+                return Err(self.refusal.clone());
             }
         }
         self.inner.put(key, data, cond)
@@ -710,16 +714,20 @@ impl ObjectStore for PointerRace {
     }
 }
 
-/// A pointer put that loses its `If-Match` race is not a store failure: the writer re-reads the
-/// pointer and decides again, without spending the write budget (one try here). If the other
-/// writer left the pointer behind this commit, it is moved forward; if it already points at this
-/// commit, nothing more is written.
+/// A pointer put that loses its race (412 or 409) is not a store failure: the writer re-reads
+/// the pointer and decides again, without spending the write budget (one try here). If the
+/// other writer left the pointer behind this commit, it is moved forward; if it already points
+/// at this commit, nothing more is written.
 #[test]
 fn a_pointer_put_that_loses_a_race_rereads_and_ends_at_the_latest() {
-    for (other, puts) in [(1u64, 2usize), (2, 1)] {
+    let cases = [StoreError::PreconditionFailed, StoreError::Conflict]
+        .into_iter()
+        .flat_map(|refusal| [(refusal.clone(), 1u64, 2usize), (refusal, 2, 1)]);
+    for (refusal, other, puts) in cases {
         let store = Arc::new(PointerRace {
             inner: MemObjectStore::new(),
             race: Default::default(),
+            refusal: refusal.clone(),
             pointer_puts: Default::default(),
         });
         let ms = ManifestStore::new(store.clone(), keys())
@@ -736,12 +744,12 @@ fn a_pointer_put_that_loses_a_race_rereads_and_ends_at_the_latest() {
         assert_eq!(
             pointer_value(&store.inner),
             Some(2),
-            "other writer at {other}"
+            "{refusal:?}, other writer at {other}"
         );
         assert_eq!(
             store.pointer_puts.load(SeqCst),
             puts,
-            "other writer at {other}"
+            "{refusal:?}, other writer at {other}"
         );
     }
 }

@@ -1003,6 +1003,42 @@ fn endless_empty_refusals_end_a_write_after_bounded_tries() {
     assert_eq!(wal_entries(&mem), 0);
 }
 
+/// Another writer commits a schema extension of its own right before each of our schema
+/// commits, so every try loses a real race. After `SCHEMA_COMMIT_ATTEMPTS` (32) lost races the
+/// write reports `SchemaCommitContention` and appends nothing; each lost race costs one create.
+#[test]
+fn schema_commit_contention_when_other_commits_keep_winning() {
+    let mem = Arc::new(MemObjectStore::new());
+    let hooked = Hooked::new(&mem);
+    let n = Namespace::new(hooked.clone(), keys(), DIMS).unwrap();
+    let (other, ours) = (ns(&mem), Arc::new(std::sync::atomic::AtomicUsize::new(0)));
+    let o = ours.clone();
+    hooked.on_put(move |key| {
+        if is_manifest_version(key) {
+            let i = o.fetch_add(1, SeqCst);
+            let name = format!("other_{i}");
+            other
+                .write(
+                    1000 + i as u64,
+                    &[Op::upsert(&name, vec![]).with_attr(&name, price(1))],
+                )
+                .unwrap();
+        }
+        PutAction::Pass
+    });
+    assert_eq!(
+        n.write(1, &[Op::upsert("a", vec![]).with_attr("size", price(1))]),
+        Err(NamespaceError::SchemaCommitContention)
+    );
+    assert_eq!(ours.load(SeqCst), 32, "one create per lost race");
+    assert_eq!(
+        latest_manifest(&mem).0.get(),
+        32,
+        "every version is the other's"
+    );
+    assert_eq!(wal_entries(&mem), 32, "only the other writer's batches");
+}
+
 /// One refused create with nothing behind it does not fail a flush: the commit reads the key
 /// back, finds nothing and tries again.
 #[test]
