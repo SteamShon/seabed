@@ -269,6 +269,18 @@ mod tests {
         assert_eq!(a.queries(5, 1), b.queries(5, 1));
     }
 
+    /// Pins both streams, so drawing attributes from the vector stream (or seeding the two
+    /// alike) is a visible test change: a change here changes every dataset built from a
+    /// seed. `below` takes one draw whatever the cardinality, so comparing two
+    /// cardinalities alone would not see the streams mixing.
+    #[test]
+    fn vector_and_attr_streams_are_pinned() {
+        let d = spec().generate().data;
+        assert_eq!(d.vectors[0][0].to_bits(), 1_063_037_242);
+        assert_eq!(d.vectors[9_999][7].to_bits(), 3_209_411_508);
+        assert_eq!(d.attrs[..4], [206, 620, 705, 860]);
+    }
+
     #[test]
     fn attr_below_keeps_about_the_chosen_fraction() {
         let d = spec().generate().data;
