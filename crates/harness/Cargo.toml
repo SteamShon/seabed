@@ -1,0 +1,13 @@
+[package]
+name = "seabed-harness"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+[dependencies]
+seabed-adapter-objectstore-mem = { path = "../adapter-objectstore-mem" }
+
+[dev-dependencies]
+seabed-domain = { path = "../domain" }
+seabed-engine = { path = "../engine" }
+proptest = "1"
