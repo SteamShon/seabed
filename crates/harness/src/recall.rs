@@ -69,9 +69,9 @@ impl RecallReport {
         }
     }
 
-    /// Adds one query's recall. Only for queries with something to find: a query whose filter
-    /// kept no document goes to `add_empty` (or use `add_query`, which decides).
-    pub fn add(&mut self, selectivity: f64, recall: f64) {
+    /// Adds one query's recall. Only for queries with something to find, which is why it is
+    /// not public: callers go through `add_query`, which decides, or `add_empty`.
+    pub(crate) fn add(&mut self, selectivity: f64, recall: f64) {
         assert!((0.0..=1.0).contains(&recall), "recall {recall}");
         let band = self.band(selectivity);
         self.samples[band].push(recall);
@@ -90,6 +90,15 @@ impl RecallReport {
         } else {
             self.add(selectivity, recall_at_k(truth, got, k));
         }
+    }
+
+    /// The `(lower, upper]` bands that no query with something to find landed in, most
+    /// selective first. `meets` says nothing about these.
+    pub fn unjudged_bands(&self) -> Vec<(f64, f64)> {
+        (0..self.edges.len())
+            .filter(|i| self.samples[*i].is_empty())
+            .map(|i| (if i == 0 { 0.0 } else { self.edges[i - 1] }, self.edges[i]))
+            .collect()
     }
 
     /// Queries counted by `add_empty`, over all bands.
@@ -136,7 +145,7 @@ impl RecallReport {
     }
 
     /// The band with the lowest mean recall; on a tie the more selective band. `None` when
-    /// no query was added.
+    /// no query had something to find.
     pub fn weakest(&self) -> Option<BandSummary> {
         self.bands()
             .into_iter()
@@ -146,6 +155,10 @@ impl RecallReport {
     /// The recall half of the M0 criterion (3): mean recall in the weakest band is at least
     /// `threshold` (0.90 in PLAN 2장). The p99 latency half is not judged here. False when
     /// there is nothing to judge.
+    ///
+    /// Only bands that received a query with something to find are judged: a run whose most
+    /// selective band got no such query passes without it. Check `unjudged_bands` before
+    /// reporting a pass.
     pub fn meets(&self, threshold: f64) -> bool {
         self.weakest().is_some_and(|w| w.mean >= threshold)
     }
@@ -199,6 +212,20 @@ mod tests {
     }
 
     #[test]
+    fn unjudged_bands_lists_the_bands_meets_did_not_see() {
+        let mut r = RecallReport::new(&DEFAULT_BAND_EDGES);
+        r.add(0.05, 1.0);
+        r.add_empty(0.00001);
+        assert!(r.meets(0.9));
+        assert_eq!(
+            r.unjudged_bands(),
+            [(0.0, 0.0001), (0.0001, 0.001), (0.001, 0.01), (0.1, 1.0)]
+        );
+        r.add(0.00001, 1.0);
+        assert_eq!(r.unjudged_bands()[0], (0.0001, 0.001));
+    }
+
+    #[test]
     fn weakest_band_decides_the_criterion() {
         let mut r = RecallReport::new(&DEFAULT_BAND_EDGES);
         assert_eq!(r.weakest(), None);
@@ -246,6 +273,7 @@ mod tests {
         let mut only_empty = RecallReport::new(&DEFAULT_BAND_EDGES);
         only_empty.add_empty(0.0);
         assert!(only_empty.bands().is_empty());
+        assert_eq!(only_empty.unjudged_bands().len(), DEFAULT_BAND_EDGES.len());
         assert!(!only_empty.meets(0.9));
         assert_eq!(only_empty.empty_queries(), 1);
     }
