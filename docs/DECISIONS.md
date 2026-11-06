@@ -31,7 +31,9 @@
 - [결정] M1의 WAL과 manifest는 직접 구현한 뒤 SlateDB 어댑터와 비교.
 - [결정] 프로젝트 이름은 seabed(이름 충돌은 직접 확인 필요: crates.io, GitHub, 도메인, 상표).
 - [결정] 라이선스와 SaaS 운영 주체는 공개 시점에 결정.
-- [제안] segment 파일은 끝에 footer TOC(섹션 오프셋, 길이, SHA-256), manifest에 임베딩 모델 id와 차원, 거리 지표, 양자화, 토크나이저를 기록하고 불일치 시 즉시 실패(memvid 참고).
+- [결정, 2026-11-06] segment 파일은 끝에 footer TOC(섹션 오프셋, 길이, SHA-256), manifest에 임베딩 모델 id와 차원, 거리 지표, 양자화, 토크나이저를 기록하고 불일치 시 즉시 실패(memvid 참고). M1에 구현됨(PLAN 6.5).
+- [결정, 2026-11-06] SoT와 인덱스 분리: 원본은 object storage의 불변 segment(Parquet SoT) + manifest, 모든 인덱스는 파생(PLAN 5장 1). M1에 구현됨.
+- [결정, 2026-11-06] tenant와 namespace 식별자를 모든 키와 manifest에 처음부터 포함(PLAN 5장 7). M1에 구현됨.
 - [제안] 쓰기 응답에 LSN 기반 일관성 토큰, 쿼리에 min_lsn(Loams 참고). ES와 Qdrant 호환 API 어댑터도 후보.
 - [제안] bulk 경로: 외부 파일 등록(zero-copy), 파티션 단위 병렬 인덱스 빌드와 재개, manifest 교체로 원자적 공개. 경로는 증분 / 부분 재빌드 / 전체 재빌드 중 파티션 단위로 선택.
 
