@@ -89,17 +89,38 @@ fn parse_count(name: &str, v: &str) -> Result<u64, String> {
         .map_err(|_| format!("{name} must be a non-negative number, got {v:?}"))
 }
 
-/// Reports the seed if the test panics while this guard is alive. `new` writes to stderr;
-/// `with_output` takes another writer (for tests of the guard itself).
-pub struct SeedOnPanic<W: Write = std::io::Stderr> {
+/// Reports the seed, and the test it belongs to, if the test panics while this guard is alive.
+/// `new` writes through `eprint!`, so the test harness captures it with the failing test's
+/// output; `with_output` takes another writer (for tests of the guard itself).
+pub struct SeedOnPanic<W: Write = CapturedStderr> {
     seed: u64,
     out: W,
 }
 
 impl SeedOnPanic {
     pub fn new(seed: u64) -> Self {
-        Self::with_output(seed, std::io::stderr())
+        Self::with_output(seed, CapturedStderr)
     }
+}
+
+/// Writes through `eprint!` (which the test harness captures), unlike `std::io::stderr()`.
+pub struct CapturedStderr;
+
+impl Write for CapturedStderr {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        eprint!("{}", String::from_utf8_lossy(buf));
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The line `SeedOnPanic` writes. The test harness names each test's thread after the test.
+fn seed_report(seed: u64) -> String {
+    let thread = std::thread::current();
+    let test = thread.name().unwrap_or("<unnamed>");
+    format!("fault-injection test {test} failed with seed {seed}")
 }
 
 impl<W: Write> SeedOnPanic<W> {
@@ -111,11 +132,7 @@ impl<W: Write> SeedOnPanic<W> {
 impl<W: Write> Drop for SeedOnPanic<W> {
     fn drop(&mut self) {
         if std::thread::panicking() {
-            let _ = writeln!(
-                self.out,
-                "fault-injection test failed with seed {}",
-                self.seed
-            );
+            let _ = writeln!(self.out, "{}", seed_report(self.seed));
         }
     }
 }
@@ -275,7 +292,7 @@ mod tests {
     }
 
     #[test]
-    fn seed_on_panic_reports_the_seed_only_when_panicking() {
+    fn seed_on_panic_reports_the_seed_and_test_only_when_panicking() {
         let out = Shared::default();
         drop(SeedOnPanic::with_output(8, out.clone()));
         assert!(out.0.lock().unwrap().is_empty(), "silent without a panic");
@@ -288,7 +305,10 @@ mod tests {
         assert!(r.is_err());
         assert_eq!(
             String::from_utf8(out.0.lock().unwrap().clone()).unwrap(),
-            "fault-injection test failed with seed 7\n"
+            format!(
+                "fault-injection test {} failed with seed 7\n",
+                std::thread::current().name().unwrap()
+            )
         );
     }
 }

@@ -620,10 +620,31 @@ fn open_ref_with_a_different_size_replacement_is_corrupt_not_ref_mismatch() {
 /// before it, and every writer's accepted commit must appear exactly once.
 #[test]
 fn concurrent_commit_content_with_faults_keeps_successor_rules() {
-    const WRITERS: u64 = 4;
-    const PER_WRITER: u64 = 5;
     for seed in fault_seeds(1..11) {
         let _seed = SeedOnPanic::new(seed);
+        concurrent_commit_content_with_faults_keeps_successor_rules_with(seed);
+    }
+}
+
+/// Any seed works, also near `u64::MAX`: the per-writer seeds are mixed, not multiplied.
+#[test]
+fn fault_seed_near_max_does_not_overflow() {
+    concurrent_commit_content_with_faults_keeps_successor_rules_with(u64::MAX - 1);
+}
+
+/// A seed for fault stream `stream` of the run with `seed` (splitmix64 of both). Distinct
+/// `(seed, stream)` pairs get unrelated streams, and no input overflows.
+fn sub_seed(seed: u64, stream: u64) -> u64 {
+    let mut z = seed ^ stream.wrapping_add(1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+fn concurrent_commit_content_with_faults_keeps_successor_rules_with(seed: u64) {
+    const WRITERS: u64 = 4;
+    const PER_WRITER: u64 = 5;
+    {
         let mem = Arc::new(MemObjectStore::new());
         let cfg = FaultConfig {
             seed,
@@ -634,7 +655,7 @@ fn concurrent_commit_content_with_faults_keeps_successor_rules() {
             list_unavailable_ppm: 100_000,
         };
         // One fault injector per writer, all over the same store: the race is real, and each
-        // writer's fault sequence depends only on its own seed (`seed * WRITERS + w`).
+        // writer's fault sequence depends only on its own seed (`sub_seed(seed, w)`).
         let store_for = |s: u64| {
             ManifestStore::new(
                 Arc::new(FaultInjecting::new(
@@ -647,7 +668,7 @@ fn concurrent_commit_content_with_faults_keeps_successor_rules() {
             .with_retry_policy(RetryPolicy::immediate(64))
             .with_write_retry_policy(RetryPolicy::immediate(64))
         };
-        let ms = store_for(seed * 1000);
+        let ms = store_for(sub_seed(seed, WRITERS));
         // An injected 409 leaves no object, so `commit` reads nothing back and tries again; only
         // a 409 on every try of the write budget surfaces as `CommitConflict`. The contract is
         // still to reload and retry.
@@ -662,7 +683,7 @@ fn concurrent_commit_content_with_faults_keeps_successor_rules() {
 
         thread::scope(|sc| {
             for w in 0..WRITERS {
-                let ms = store_for(seed * WRITERS + w);
+                let ms = store_for(sub_seed(seed, w));
                 sc.spawn(move || {
                     let mut done = 0;
                     let mut attempt = 0u64;
