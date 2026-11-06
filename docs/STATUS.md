@@ -1,8 +1,8 @@
 # seabed 진행 상황
 
-마지막 갱신: 2026-11-06 · develop bfc2cd1 · main 7fe9637 (#18 릴리스)
+반영 범위: develop #21까지 · main은 #18 릴리스까지 (2026-11-06)
 
-마일스톤과 목표는 [PLAN.md](PLAN.md) 7장, 결정은 [DECISIONS.md](DECISIONS.md)에 있습니다. 이 문서는 "무엇이 됐고 무엇이 남았는지"만 적습니다. 기능이나 범위를 바꾸는 PR은 이 문서를 같이 고칩니다(AGENTS.md).
+마일스톤과 목표는 [PLAN.md](PLAN.md) 7장, 결정은 [DECISIONS.md](DECISIONS.md)에 있습니다. 이 문서는 "무엇이 됐고 무엇이 남았는지"만 적습니다. PR 때문에 이 문서의 어떤 줄이 틀리게 되면 같은 PR에서 고칩니다. 규칙은 [AGENTS.md](../AGENTS.md)의 "진행 상황 기록"에 있습니다.
 
 표기: ✅ 됨 · 🟡 일부 · ⬜ 안 됨
 
@@ -21,7 +21,7 @@
 
 ## M0 평가 기반
 
-- ✅ 판정 기준 초안 고정: 전체 재빌드 24시간 이내, 월 비용 turbopuffer +30% 이내, 가장 약한 구간 recall@10 ≥ 0.90 (#4, PLAN 2장)
+- ✅ 판정 기준 초안 고정: 전체 재빌드 24시간 이내(그동안 서비스 p99 증가 10% 이내), 월 비용 turbopuffer +30% 이내, 가장 약한 구간 recall@10 ≥ 0.90(p99 ≤ 1초) (#4, PLAN 2장)
 - ⬜ 벤치마크 러너(VectorDBBench 재사용), recall 하네스, 필터 생성기(HCBGen 기반)
 - ⬜ 비용 모델(S3 요청 수 포함), turbopuffer 가격 확인
 - ⬜ 시나리오 S1~S10
@@ -38,13 +38,13 @@ M0 결과가 "새로 만들지, 기여·재사용할지"를 정하므로, M2 이
 | ObjectStore conformance 스위트 | 🟡 메모리 어댑터만 | 초기 |
 | WAL: LSN 선점(`If-None-Match`), 결과 모름 처리 | ✅ | 초기, #16 |
 | WAL: 결과 모름 뒤 재시도 중복 방지 | 🟡 같은 `Wal` 인스턴스 안에서만 | #17, #19 |
-| manifest CAS 커밋, 최신 포인터(읽기 GET 약 3회) | ✅ | #5, #16, #19 |
+| manifest CAS 커밋(`If-None-Match`), 최신 포인터(`If-Match` 전진 + 앞으로 탐색, 읽기 GET 약 3회) | ✅ | 초기, #5, #16, #19 |
 | 불변 segment 포맷(footer TOC, SHA-256) | ✅ | #6 |
 | 타입이 있는 manifest 내용(segment 목록, `indexed_through`, `IndexBinding`) | ✅ | #8, #10 |
 | Parquet SoT, namespace 속성 스키마(추가만) | ✅ | #11, #13 |
 | `Namespace` 쓰기 · flush · strong 읽기(WAL 꼬리 병합) | ✅ | #14 |
 | 쓰기 경로 재시도 예산 | ✅ | #16 |
-| 오류 enum `#[non_exhaustive]`, nightly 장애 주입(시드 1000개) | ✅ (nightly는 main 릴리스 뒤 활성) | #20 |
+| 오류 enum `#[non_exhaustive]`, nightly 장애 주입(시드 1000개) | 🟡 nightly는 아직 GitHub에 등록되지 않음(workflow 조회 404, 2026-11-06). 기본 브랜치(main)에 들어간 뒤 수동 실행으로 확인 | #20 |
 | 실제 S3 / S3 호환 에뮬레이터 어댑터와 conformance | ⬜ | |
 | SlateDB 어댑터와 conformance 비교 | ⬜ | |
 | 고아 SoT GC, WAL GC, 오래된 manifest 정리 · 체크포인트 | ⬜ | |
@@ -53,7 +53,13 @@ M0 결과가 "새로 만들지, 기여·재사용할지"를 정하므로, M2 이
 | eventual 읽기(캐시 스냅샷), 쓰기 응답 LSN 토큰과 `min_lsn` | ⬜ | |
 | 인제스트 정책 프리셋(realtime / balanced / bulk) | ⬜ | |
 
-### M1 동작 메모 (PLAN 7장에서 옮김)
+### M1 동작 메모
+
+PLAN 7장의 "현재 상태" 문단에 있던 동작 설명을 옮기고, 리뷰에서 나온 주의점을 더했습니다.
+
+- `Namespace::write`는 쓰기 전에 묶음을 검증하고, WAL 레코드 v1(upsert/delete 묶음)로 한 항목에 붙인다. strong 읽기는 모든 segment와 `indexed_through` 이후 WAL 꼬리를 id마다 LSN이 가장 큰 행으로 병합하고 tombstone을 반영한다.
+- 쓰기 재시도 정책은 `RetryPolicy`이고, `Namespace::with_write_retry_policy`가 WAL, manifest, SoT 세 곳을 한 번에 바꾼다.
+- 결과 모름 뒤 재시도 중복 방지의 규칙: 후보는 항목 전체(request id와 payload)가 같을 때만 자기 것으로 본다. 재시도가 성공하면 그 LSN을 기억(Landed)해 다음 재시도에 저장소를 보지 않고 답한다. 같은 request id의 append는 한 번에 하나씩 돌아, 동시 재시도도 한 번만 붙는다.
 
 - 새 속성은 write가 WAL에 붙이기 전에 스키마를 넓힌 manifest를 먼저 커밋한다. 그래서 타입 충돌은 순차든 경합이든 write에서 거부되고 flush가 막히지 않는다. 스키마 커밋이 `SCHEMA_COMMIT_ATTEMPTS`번 모두 지면 `SchemaCommitContention`.
 - WAL 레코드는 `float_roundtrip`으로 f32·f64를 비트 그대로 보존한다.
@@ -75,15 +81,18 @@ M0 결과가 "새로 만들지, 기여·재사용할지"를 정하므로, M2 이
 1. M1: S3 호환 어댑터와 conformance (모든 결과의 전제)
 2. M0: 최소 하네스(recall, 비용)
 3. M2: 정적 빌드 설계 문서 → 구현
-4. 릴리스 뒤 nightly 수동 실행으로 동작 확인 (#20 리뷰 제안)
+4. 다음 릴리스(develop → main) 뒤 nightly를 수동 실행해 동작 확인 (#20, #21 리뷰 제안)
 
 ### 남은 작은 항목 (리뷰에서 "나중에")
+
+#20 리뷰부터 모읍니다. #17, #19의 열린 항목은 아직 옮기지 않았습니다(예: `CommitConflict` 문서의 "find out" 조건, `ScriptedVersions`의 첫 GET 순서 문서화, `Wal::pending_len` 공개 여부).
 
 - `namespace.rs` 문서의 "(32)" 표기와 줄바꿈 (#20)
 - manifest_content 장애 주입 테스트에서 덮어써지는 `cfg.seed` (#20)
 - CONTRIBUTING에 `#[non_exhaustive]` 정책과 "새 `StoreError` variant는 engine의 분류 지점 세 곳(manifest, wal, sot)을 확인" 규칙 (#20)
 - nightly: `workflow_dispatch`의 `ref` 선택, `permissions: contents: read`, `timeout-minutes` (#20)
+- `docs/PLAN.md` 6.4의 "`load_latest`는 manifest prefix 전체를 LIST"는 #5 이후 낡은 문장 (#21)
 
 ## 갱신 기록
 
-- 2026-11-06: 문서 신설. #20까지 반영. PLAN 7장의 현재 상태 문단을 옮김.
+- 2026-11-06: 문서 신설(#21). #20까지 반영. PLAN 7장의 현재 상태 문단을 옮김.

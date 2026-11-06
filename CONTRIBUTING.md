@@ -45,8 +45,7 @@ cargo test --workspace
 
 ## 진행 상황 기록
 
-- 마일스톤별 진행 상황은 [docs/STATUS.md](docs/STATUS.md)에 둡니다. 기능, 범위, 마일스톤 상태를 바꾸는 PR은 같은 PR에서 이 문서를 갱신합니다.
-- 리뷰에서 "나중에"로 남긴 항목은 STATUS.md의 "남은 작은 항목"에 적어, 다음 작업을 고를 때 한곳에서 봅니다.
+마일스톤별 진행 상황과 리뷰에서 "나중에"로 남은 항목은 [docs/STATUS.md](docs/STATUS.md)에 둡니다. 갱신 규칙은 [AGENTS.md](AGENTS.md)의 "진행 상황 기록"과 같습니다.
 
 ## 커밋
 
