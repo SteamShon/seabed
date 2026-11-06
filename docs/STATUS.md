@@ -1,0 +1,89 @@
+# seabed 진행 상황
+
+마지막 갱신: 2026-11-06 · develop bfc2cd1 · main 7fe9637 (#18 릴리스)
+
+마일스톤과 목표는 [PLAN.md](PLAN.md) 7장, 결정은 [DECISIONS.md](DECISIONS.md)에 있습니다. 이 문서는 "무엇이 됐고 무엇이 남았는지"만 적습니다. 기능이나 범위를 바꾸는 PR은 이 문서를 같이 고칩니다(AGENTS.md).
+
+표기: ✅ 됨 · 🟡 일부 · ⬜ 안 됨
+
+## 요약
+
+| 마일스톤 | 단계 | 상태 | 비고 |
+| --- | --- | --- | --- |
+| M0 평가 기반 | - | 🟡 판정 기준만 | 코드 없음. 판정 기준은 잠정 결정 |
+| M1 저장 primitive | 1 | 🟡 기능 범위 완료 | 실제 S3(또는 S3 호환 에뮬레이터) 어댑터 없음 |
+| M2 벡터 인덱스 | 1 → 2 | ⬜ | segment 참조에 `index` 자리만 있음 |
+| M3 속성 인덱스 · 필터 · 텍스트 | 2 | ⬜ | |
+| M4 업데이트 경로 | 2 → 3 | ⬜ | |
+| M4.5 분산 검증 | 3 | ⬜ | |
+| M5 사내 workload | 3 | ⬜ | |
+| M6 논문 | - | ⬜ | |
+
+## M0 평가 기반
+
+- ✅ 판정 기준 초안 고정: 전체 재빌드 24시간 이내, 월 비용 turbopuffer +30% 이내, 가장 약한 구간 recall@10 ≥ 0.90 (#4, PLAN 2장)
+- ⬜ 벤치마크 러너(VectorDBBench 재사용), recall 하네스, 필터 생성기(HCBGen 기반)
+- ⬜ 비용 모델(S3 요청 수 포함), turbopuffer 가격 확인
+- ⬜ 시나리오 S1~S10
+- ⬜ 기준선 측정: Chroma, Lance, Milvus, Qdrant, VectorChord
+
+M0 결과가 "새로 만들지, 기여·재사용할지"를 정하므로, M2 이상을 크게 진행하기 전에 최소 하네스가 필요합니다.
+
+## M1 저장 primitive
+
+| 항목 | 상태 | PR |
+| --- | --- | --- |
+| ObjectStore 포트, 메모리 어댑터, 장애 주입, 요청 수 계측 | ✅ | 초기, #3 |
+| 읽기 재시도 내장(`Retrying`) | ✅ | #3 |
+| ObjectStore conformance 스위트 | 🟡 메모리 어댑터만 | 초기 |
+| WAL: LSN 선점(`If-None-Match`), 결과 모름 처리 | ✅ | 초기, #16 |
+| WAL: 결과 모름 뒤 재시도 중복 방지 | 🟡 같은 `Wal` 인스턴스 안에서만 | #17, #19 |
+| manifest CAS 커밋, 최신 포인터(읽기 GET 약 3회) | ✅ | #5, #16, #19 |
+| 불변 segment 포맷(footer TOC, SHA-256) | ✅ | #6 |
+| 타입이 있는 manifest 내용(segment 목록, `indexed_through`, `IndexBinding`) | ✅ | #8, #10 |
+| Parquet SoT, namespace 속성 스키마(추가만) | ✅ | #11, #13 |
+| `Namespace` 쓰기 · flush · strong 읽기(WAL 꼬리 병합) | ✅ | #14 |
+| 쓰기 경로 재시도 예산 | ✅ | #16 |
+| 오류 enum `#[non_exhaustive]`, nightly 장애 주입(시드 1000개) | ✅ (nightly는 main 릴리스 뒤 활성) | #20 |
+| 실제 S3 / S3 호환 에뮬레이터 어댑터와 conformance | ⬜ | |
+| SlateDB 어댑터와 conformance 비교 | ⬜ | |
+| 고아 SoT GC, WAL GC, 오래된 manifest 정리 · 체크포인트 | ⬜ | |
+| 프로세스 간 멱등성 색인(재시작 뒤 재시도 중복 방지) | ⬜ | |
+| writer fencing(epoch), group commit | ⬜ | |
+| eventual 읽기(캐시 스냅샷), 쓰기 응답 LSN 토큰과 `min_lsn` | ⬜ | |
+| 인제스트 정책 프리셋(realtime / balanced / bulk) | ⬜ | |
+
+### M1 동작 메모 (PLAN 7장에서 옮김)
+
+- 새 속성은 write가 WAL에 붙이기 전에 스키마를 넓힌 manifest를 먼저 커밋한다. 그래서 타입 충돌은 순차든 경합이든 write에서 거부되고 flush가 막히지 않는다. 스키마 커밋이 `SCHEMA_COMMIT_ATTEMPTS`번 모두 지면 `SchemaCommitContention`.
+- WAL 레코드는 `float_roundtrip`으로 f32·f64를 비트 그대로 보존한다.
+- 쓰기 경로(WAL append, manifest 커밋, SoT 쓰기)의 일시 장애는 쓰기 재시도 정책(기본 8회, 20 ms에서 1 s까지 지수 백오프와 jitter)으로 다시 시도하고, 다 쓰면 마지막 `Unavailable`(결과 모름)을 돌려준다. 다른 writer에게 진 경합은 이 예산을 쓰지 않는다.
+- manifest는 거절된 생성 뒤 항상 버전을 다시 읽어 commit id를 비교한다. 결과 모름 뒤 같은 commit을 다시 하면 자기 버전을 알아본다. 같은 내용의 동시 commit은 같은 id라 함께 성공한다. 커밋 뒤 포인터 전진은 best effort로 최대 2회.
+- 결과 모름 뒤 재시도 중복 방지는 같은 `Wal`(같은 `Namespace`) 안에서만 된다(후보 LSN을 `request_id`와 항목 해시별로 최대 `MAX_PENDING`개 기억, 오래된 것부터 잊음). 다른 프로세스나 재시작 뒤 재시도는 두 번 붙을 수 있다.
+- WAL GC는 읽을 수 있는 모든 manifest의 `indexed_through` 이하만 지울 수 있다. 결과 모름 후보 LSN이 지워지면 중복 위험이 생기므로 GC 설계 때 함께 본다. writer fencing을 넣을 때는 WAL의 Landed 기억을 다시 본다.
+- 알려진 읽기 비용: strong 읽기 1회에 manifest GET 3 + segment마다 GET 1 + WAL LIST 1 + 꼬리 항목마다 GET 1(테스트로 고정). 인덱스는 M2부터.
+
+## M2 ~ M6
+
+아직 코드가 없습니다. M2 설계 때 미리 정할 것(PLAN 7장):
+
+- 필터와의 연결 지점: 클러스터별 속성 요약, 클러스터 ↔ doc id 매핑
+- 배치 fan-out 쿼리를 위한 클러스터 읽기 묶기(요청 병합, 공유 캐시)
+
+## 다음 후보
+
+1. M1: S3 호환 어댑터와 conformance (모든 결과의 전제)
+2. M0: 최소 하네스(recall, 비용)
+3. M2: 정적 빌드 설계 문서 → 구현
+4. 릴리스 뒤 nightly 수동 실행으로 동작 확인 (#20 리뷰 제안)
+
+### 남은 작은 항목 (리뷰에서 "나중에")
+
+- `namespace.rs` 문서의 "(32)" 표기와 줄바꿈 (#20)
+- manifest_content 장애 주입 테스트에서 덮어써지는 `cfg.seed` (#20)
+- CONTRIBUTING에 `#[non_exhaustive]` 정책과 "새 `StoreError` variant는 engine의 분류 지점 세 곳(manifest, wal, sot)을 확인" 규칙 (#20)
+- nightly: `workflow_dispatch`의 `ref` 선택, `permissions: contents: read`, `timeout-minutes` (#20)
+
+## 갱신 기록
+
+- 2026-11-06: 문서 신설. #20까지 반영. PLAN 7장의 현재 상태 문단을 옮김.
